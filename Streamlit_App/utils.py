@@ -419,83 +419,88 @@ def puzzle_reveal_html(value_text: str, caption_text: str, key: str, accent="#E3
 
 
 # ---------------------------------------------------------------------------
-# PARTICLE / STARFIELD BACKGROUND (pure CSS, no JS/iframe needed)
+# PARTICLE / CONSTELLATION BACKGROUND (canvas injected behind the app)
 # ---------------------------------------------------------------------------
-def particle_background_css(dark_mode=True):
-    """Build a drifting, twinkling starfield using only CSS box-shadows.
-    Rendered directly via st.markdown (unsafe_allow_html=True) so it lives
-    in the real page DOM - no iframe, no JS, nothing that can be sandboxed
-    or blocked. Three depth layers give a subtle parallax feel."""
-    dot_color = "142,202,230" if dark_mode else "70,120,160"
+def particle_background_component(dark_mode=True):
+    particle_color = "142,202,230" if dark_mode else "60,110,150"
+    line_color = "142,202,230" if dark_mode else "90,140,180"
+    bg_color = "transparent"
+    n_particles = 70
 
-    def make_layer(n, seed, size, min_op, max_op):
-        rnd = random.Random(seed)
-        shadows = []
-        for _ in range(n):
-            x = rnd.randint(0, 2000)
-            y = rnd.randint(0, 2000)
-            op = round(rnd.uniform(min_op, max_op), 2)
-            shadows.append(f"{x}px {y}px rgba({dot_color},{op})")
-        return ", ".join(shadows)
+    js = f"""
+<script>
+(function() {{
+    const doc = window.parent.document;
+    const old = doc.getElementById('hva-particle-canvas');
+    if (old) {{ old.remove(); }}
+    if (window.parent.__hvaParticleRAF) {{
+        window.parent.cancelAnimationFrame(window.parent.__hvaParticleRAF);
+    }}
 
-    layer1 = make_layer(90, 11, 1, 0.25, 0.55)   # far, faint, small
-    layer2 = make_layer(55, 22, 2, 0.35, 0.7)    # mid
-    layer3 = make_layer(28, 33, 3, 0.5, 0.9)     # near, brighter
+    const canvas = doc.createElement('canvas');
+    canvas.id = 'hva-particle-canvas';
+    canvas.style.position = 'fixed';
+    canvas.style.top = '0';
+    canvas.style.left = '0';
+    canvas.style.width = '100vw';
+    canvas.style.height = '100vh';
+    canvas.style.zIndex = '-1';
+    canvas.style.pointerEvents = 'none';
+    doc.body.appendChild(canvas);
 
-    html = f"""
-<div class="hva-starfield" aria-hidden="true">
-  <div class="hva-star-layer hva-star-l1"></div>
-  <div class="hva-star-layer hva-star-l2"></div>
-  <div class="hva-star-layer hva-star-l3"></div>
-</div>
-<style>
-.hva-starfield {{
-    position: fixed;
-    inset: 0;
-    z-index: 0;
-    overflow: hidden;
-    pointer-events: none;
-}}
-.hva-star-layer {{
-    position: absolute;
-    top: 0; left: 0;
-    width: 2000px; height: 2000px;
-    border-radius: 50%;
-}}
-.hva-star-l1 {{
-    box-shadow: {layer1};
-    width: 1px; height: 1px;
-    animation: hvaDrift1 90s linear infinite;
-}}
-.hva-star-l2 {{
-    box-shadow: {layer2};
-    width: 2px; height: 2px;
-    animation: hvaDrift2 65s linear infinite;
-}}
-.hva-star-l3 {{
-    box-shadow: {layer3};
-    width: 3px; height: 3px;
-    animation: hvaDrift3 40s linear infinite, hvaTwinkle 3.5s ease-in-out infinite alternate;
-}}
-@keyframes hvaDrift1 {{
-    from {{ transform: translate(0, 0); }}
-    to   {{ transform: translate(-400px, 300px); }}
-}}
-@keyframes hvaDrift2 {{
-    from {{ transform: translate(0, 0); }}
-    to   {{ transform: translate(300px, -350px); }}
-}}
-@keyframes hvaDrift3 {{
-    from {{ transform: translate(0, 0); }}
-    to   {{ transform: translate(-250px, -300px); }}
-}}
-@keyframes hvaTwinkle {{
-    from {{ opacity: 0.6; }}
-    to   {{ opacity: 1; }}
-}}
-</style>
+    const ctx = canvas.getContext('2d');
+    function resize() {{
+        canvas.width = window.parent.innerWidth;
+        canvas.height = window.parent.innerHeight;
+    }}
+    resize();
+    window.parent.addEventListener('resize', resize);
+
+    const N = {n_particles};
+    let particles = [];
+    for (let i = 0; i < N; i++) {{
+        particles.push({{
+            x: Math.random() * canvas.width,
+            y: Math.random() * canvas.height,
+            vx: (Math.random() - 0.5) * 0.35,
+            vy: (Math.random() - 0.5) * 0.35,
+            r: Math.random() * 1.6 + 0.6
+        }});
+    }}
+
+    function tick() {{
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        for (let p of particles) {{
+            p.x += p.vx; p.y += p.vy;
+            if (p.x < 0 || p.x > canvas.width) p.vx *= -1;
+            if (p.y < 0 || p.y > canvas.height) p.vy *= -1;
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba({particle_color},0.85)';
+            ctx.fill();
+        }}
+        for (let i = 0; i < N; i++) {{
+            for (let j = i + 1; j < N; j++) {{
+                const a = particles[i], b = particles[j];
+                const dx = a.x - b.x, dy = a.y - b.y;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist < 130) {{
+                    ctx.beginPath();
+                    ctx.moveTo(a.x, a.y);
+                    ctx.lineTo(b.x, b.y);
+                    ctx.strokeStyle = 'rgba({line_color},' + (1 - dist / 130) * 0.35 + ')';
+                    ctx.lineWidth = 0.6;
+                    ctx.stroke();
+                }}
+            }}
+        }}
+        window.parent.__hvaParticleRAF = window.parent.requestAnimationFrame(tick);
+    }}
+    tick();
+}})();
+</script>
 """
-    return html
+    return js
 
 
 # ---------------------------------------------------------------------------
@@ -539,13 +544,8 @@ def theme_css(dark_mode=True):
     --hva-shadow: {shadow};
 }}
 
-html, body {{
-    background-color: {bg} !important;
-}}
 [data-testid="stAppViewContainer"], [data-testid="stApp"] {{
-    background-color: transparent !important;
-    position: relative;
-    z-index: 1;
+    background-color: {bg} !important;
 }}
 [data-testid="stHeader"] {{ background: transparent !important; }}
 [data-testid="stSidebar"] {{ display: none; }}
