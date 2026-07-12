@@ -25,7 +25,7 @@ from utils import (
     format_inr, short_inr, usd_to_inr, indian_grouping,
     LOCATION_DISPLAY, display_locations, to_raw_location, LOCATION_ICON,
     get_quality_traits, explain_price, price_tier,
-    render_house_svg, puzzle_reveal_html, particle_background_css,
+    render_house_svg, puzzle_reveal_html, particle_background_component,
     theme_css,
 )
 
@@ -82,7 +82,7 @@ if "reveal_counter_cmp" not in st.session_state:
 # ---------------------------------------------------------------------------
 # BACKGROUND + THEME
 # ---------------------------------------------------------------------------
-st.markdown(particle_background_css(st.session_state["dark_mode"]), unsafe_allow_html=True)
+components.html(particle_background_component(st.session_state["dark_mode"]), height=0)
 st.markdown(theme_css(st.session_state["dark_mode"]), unsafe_allow_html=True)
 
 
@@ -234,7 +234,9 @@ with tab_estimate:
     if "last_input" in st.session_state:
         st.write("")
         with st.expander("View raw input sent to the model"):
-            st.dataframe(st.session_state["last_input"].T.rename(columns={0: "Value"}), use_container_width=True)
+            debug_df = st.session_state["last_input"].T.rename(columns={0: "Value"})
+            debug_df["Value"] = debug_df["Value"].astype(str)
+            st.dataframe(debug_df, use_container_width=True)
 
 # ===========================================================================
 # TAB 2 — COMPARE
@@ -265,7 +267,7 @@ with tab_compare:
                 pool = st.checkbox("Pool", value=False, key=f"{prefix}_pool")
             with a4:
                 school = st.checkbox("School", value=True, key=f"{prefix}_school")
-        return area, bed, bath, age, dist, garage, garden, pool, school, loc
+        return area, bed, bath, age, dist, loc, garage, garden, pool, school
 
     with colA:
         specs_a = property_form("A", 1800, 1)
