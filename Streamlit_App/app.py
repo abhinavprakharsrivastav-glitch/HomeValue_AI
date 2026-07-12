@@ -267,7 +267,7 @@ with tab_compare:
                 pool = st.checkbox("Pool", value=False, key=f"{prefix}_pool")
             with a4:
                 school = st.checkbox("School", value=True, key=f"{prefix}_school")
-        return area, bed, bath, age, dist, loc, garage, garden, pool, school
+        return area, bed, bath, age, dist, garage, garden, pool, school, loc
 
     with colA:
         specs_a = property_form("A", 1800, 1)
