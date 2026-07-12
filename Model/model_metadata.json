@@ -1,0 +1,47 @@
+{
+  "best_model": "XGBoost",
+  "feature_cols_numeric": [
+    "area_sqft",
+    "bedrooms",
+    "bathrooms",
+    "age_years",
+    "distance_to_city_km",
+    "total_rooms",
+    "amenity_score",
+    "is_new",
+    "garage",
+    "garden",
+    "pool",
+    "near_school"
+  ],
+  "feature_cols_categorical": [
+    "location"
+  ],
+  "locations": [
+    "City Center",
+    "Downtown",
+    "Rural",
+    "Suburb",
+    "Uptown"
+  ],
+  "metrics": {
+    "Linear Regression": {
+      "MAE": 23479.222157102366,
+      "MSE": 1547565892.3616235,
+      "RMSE": 39339.11402613973,
+      "R2": 0.9028404609666266
+    },
+    "Random Forest": {
+      "MAE": 22606.946392321057,
+      "MSE": 1477690155.8161428,
+      "RMSE": 38440.735630527975,
+      "R2": 0.9072274110705838
+    },
+    "XGBoost": {
+      "MAE": 20830.3173046875,
+      "MSE": 1392678621.9089596,
+      "RMSE": 37318.60959238647,
+      "R2": 0.9125646193198154
+    }
+  }
+}
