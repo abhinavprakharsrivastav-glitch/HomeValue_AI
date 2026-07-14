@@ -169,6 +169,16 @@ with tab_estimate:
             st.markdown('<div class="eyebrow">Estimated Value</div>', unsafe_allow_html=True)
 
             if predict_clicked:
+                st.session_state["has_predicted"] = True
+                st.session_state["reveal_counter"] += 1
+
+            if st.session_state.get("has_predicted"):
+                # Recompute on every rerun (not just on click) so the price
+                # stays in sync as the user tweaks area/bedrooms/etc. after
+                # the first reveal — sliders/number_input changes rerun the
+                # script but do NOT set predict_clicked=True, so gating the
+                # prediction behind that flag freezes the price until the
+                # button is pressed again.
                 input_df, row = build_input_df(
                     area_sqft, bedrooms, bathrooms, age_years, distance_to_city_km,
                     garage, garden, pool, near_school, location
@@ -177,7 +187,6 @@ with tab_estimate:
                 st.session_state["last_input"] = input_df
                 st.session_state["last_row"] = row
                 st.session_state["last_pred"] = prediction_usd
-                st.session_state["reveal_counter"] += 1
 
             if "last_pred" in st.session_state:
                 pred = st.session_state["last_pred"]
@@ -234,9 +243,7 @@ with tab_estimate:
     if "last_input" in st.session_state:
         st.write("")
         with st.expander("View raw input sent to the model"):
-            debug_df = st.session_state["last_input"].T.rename(columns={0: "Value"})
-            debug_df["Value"] = debug_df["Value"].astype(str)
-            st.dataframe(debug_df, use_container_width=True)
+            st.dataframe(st.session_state["last_input"].T.rename(columns={0: "Value"}), use_container_width=True)
 
 # ===========================================================================
 # TAB 2 — COMPARE
@@ -267,7 +274,7 @@ with tab_compare:
                 pool = st.checkbox("Pool", value=False, key=f"{prefix}_pool")
             with a4:
                 school = st.checkbox("School", value=True, key=f"{prefix}_school")
-        return area, bed, bath, age, dist, garage, garden, pool, school, loc
+        return area, bed, bath, age, dist, loc, garage, garden, pool, school
 
     with colA:
         specs_a = property_form("A", 1800, 1)
@@ -277,6 +284,12 @@ with tab_compare:
     compare_clicked = st.button("⚖️ Compare Properties", use_container_width=True, key="cmp_btn")
 
     if compare_clicked:
+        st.session_state["has_compared"] = True
+        st.session_state["reveal_counter_cmp"] += 1
+
+    if st.session_state.get("has_compared"):
+        # Recompute on every rerun so edits to either property update the
+        # comparison immediately, instead of only on the button click.
         df_a, row_a = build_input_df(*specs_a)
         df_b, row_b = build_input_df(*specs_b)
         pred_a = float(model.predict(df_a)[0])
@@ -284,7 +297,6 @@ with tab_compare:
         st.session_state["cmp_result"] = {
             "row_a": row_a, "row_b": row_b, "pred_a": pred_a, "pred_b": pred_b
         }
-        st.session_state["reveal_counter_cmp"] += 1
 
     if "cmp_result" in st.session_state:
         res = st.session_state["cmp_result"]
