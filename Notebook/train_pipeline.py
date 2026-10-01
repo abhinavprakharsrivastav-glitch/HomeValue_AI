@@ -10,7 +10,7 @@ Phase 5: Feature Engineering
 Phase 6: Model Building (Linear Regression, Random Forest, XGBoost)
 Phase 7: Model Evaluation (MAE, MSE, RMSE, R2)
 
-Run:  python3 train_pipeline.py
+Run:  python train_pipeline.py   (prices are in Indian Rupees)
 """
 
 import os
@@ -66,14 +66,16 @@ print(f"Filled {missing_before} missing values using median imputation")
 
 # 3. Treat outliers using IQR capping on area_sqft and price
 def cap_outliers_iqr(series, k=1.5):
+    # k=1.5 is the textbook value; we use k=3 for price (see below) so that
+    # genuine premium-locality homes are kept and only extreme values are capped.
     q1, q3 = series.quantile(0.25), series.quantile(0.75)
     iqr = q3 - q1
     lower, upper = q1 - k * iqr, q3 + k * iqr
     return series.clip(lower, upper)
 
-for col in ["area_sqft", "price"]:
-    df[col] = cap_outliers_iqr(df[col])
-print("Outliers capped (IQR method) on: area_sqft, price")
+df["area_sqft"] = cap_outliers_iqr(df["area_sqft"], k=3.0)
+df["price"] = cap_outliers_iqr(df["price"], k=3.0)
+print("Outliers capped (IQR method, k=3) on: area_sqft, price")
 
 # 4. Encoding categorical features happens inside the sklearn Pipeline
 #    (OneHotEncoder on 'location') so it's learned only on training data
@@ -103,10 +105,11 @@ plt.savefig(f"{DOC_DIR}/eda_plots/histograms.png", dpi=110)
 plt.close()
 
 # Univariate/Bivariate: boxplots (price by location)
-plt.figure(figsize=(8, 5))
-sns.boxplot(data=df, x="location", y="price", palette="Set2")
-plt.title("Price Distribution by Location")
-plt.xticks(rotation=20)
+plt.figure(figsize=(14, 6))
+order = df.groupby("location")["price"].median().sort_values().index
+sns.boxplot(data=df, x="location", y="price", order=order, palette="Set2")
+plt.title("Price (Rs) by Prayagraj locality")
+plt.xticks(rotation=70)
 plt.tight_layout()
 plt.savefig(f"{DOC_DIR}/eda_plots/boxplot_price_location.png", dpi=110)
 plt.close()
@@ -123,7 +126,7 @@ plt.close()
 
 # Correlation heatmap
 plt.figure(figsize=(8, 6))
-corr = df[numeric_cols + ["garage", "garden", "pool", "near_school"]].corr()
+corr = df[numeric_cols + ["garage", "garden", "lift", "near_school"]].corr()
 sns.heatmap(corr, annot=True, fmt=".2f", cmap="coolwarm")
 plt.title("Correlation Heatmap")
 plt.tight_layout()
@@ -144,7 +147,7 @@ print("=" * 70)
 # New meaningful features
 df["total_rooms"] = df["bedrooms"] + df["bathrooms"]
 df["price_per_sqft_proxy"] = df["area_sqft"] / df["total_rooms"].replace(0, 1)
-df["amenity_score"] = df["garage"] + df["garden"] + df["pool"] + df["near_school"]
+df["amenity_score"] = df["garage"] + df["garden"] + df["lift"] + df["near_school"]
 df["is_new"] = (df["age_years"] <= 5).astype(int)
 
 print("Created features: total_rooms, price_per_sqft_proxy, amenity_score, is_new")
@@ -154,7 +157,7 @@ print("Created features: total_rooms, price_per_sqft_proxy, amenity_score, is_ne
 feature_cols_numeric = [
     "area_sqft", "bedrooms", "bathrooms", "age_years",
     "distance_to_city_km", "total_rooms", "amenity_score", "is_new",
-    "garage", "garden", "pool", "near_school",
+    "garage", "garden", "lift", "near_school",
 ]
 feature_cols_categorical = ["location"]
 target_col = "price"
@@ -216,9 +219,12 @@ print("=" * 70)
 results_df = pd.DataFrame(results).T.sort_values("R2", ascending=False)
 print(results_df.round(4))
 
-best_model_name = results_df["R2"].idxmax()
+# Pick the winner by MAE (average error in rupees). R2/RMSE are dominated by
+# a handful of extreme-price rows, MAE reflects the typical prediction error.
+best_model_name = results_df["MAE"].idxmin()
 best_pipeline = pipelines[best_model_name]
-print(f"\nBest model: {best_model_name} (R2 = {results_df.loc[best_model_name, 'R2']:.4f})")
+print(f"\nBest model: {best_model_name} (MAE = Rs {results_df.loc[best_model_name, 'MAE']:,.0f}, "
+      f"R2 = {results_df.loc[best_model_name, 'R2']:.4f})")
 
 # Comparative bar chart
 plt.figure(figsize=(8, 5))
@@ -235,8 +241,8 @@ preds_best = best_pipeline.predict(X_test)
 plt.figure(figsize=(6, 6))
 plt.scatter(y_test, preds_best, alpha=0.5)
 plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], "r--")
-plt.xlabel("Actual Price")
-plt.ylabel("Predicted Price")
+plt.xlabel("Actual Price (Rs)")
+plt.ylabel("Predicted Price (Rs)")
 plt.title(f"Actual vs Predicted - {best_model_name}")
 plt.tight_layout()
 plt.savefig(f"{DOC_DIR}/eda_plots/actual_vs_predicted.png", dpi=110)
