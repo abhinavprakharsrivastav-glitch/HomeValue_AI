@@ -1,0 +1,25 @@
+location,lat,lon,rate_per_sqft,rate_source,note,distance_to_city_km,tier
+Civil Lines,25.448,81.8432,10500,listing,Main commercial and business hub of the city,0.0,Premium
+George Town,25.4575,81.85,11500,listing,Upper-class planned colony (est. 1901) with many hospitals,1.26,Premium
+Tagore Town,25.4605,81.86,9000,estimate,Established premium residential colony,2.19,Premium
+Stanley Road,25.444,81.838,9850,listing,Well-connected central road close to Civil Lines,0.69,Premium
+Lukerganj,25.453,81.826,8000,listing,Established neighbourhood north of the Junction station,1.81,Premium
+Ashok Nagar,25.462,81.83,7000,listing,Established residential area with good livability,2.04,Mid-range
+Sulem Sarai,25.49,81.89,7000,listing,"Fast-growing area, strong price rise in last 3 years",6.62,Mid-range
+Allahpur,25.4553,81.8717,6200,listing,Close to Anand Bhawan and the Sangam,2.97,Mid-range
+Mumfordganj,25.465,81.848,6300,estimate,Old British-era residential neighbourhood,1.95,Mid-range
+Teliyarganj,25.48,81.863,6200,estimate,"Near MNNIT Allahabad, popular with students and staff",4.08,Mid-range
+Katra,25.4475,81.8555,6500,estimate,Major commercial market near Civil Lines,1.24,Mid-range
+Colonelganj,25.4415,81.85,6500,estimate,Dense central locality,0.99,Mid-range
+Phaphamau,25.5339,81.8539,6000,listing,Satellite township on the Lucknow highway,9.61,Mid-range
+Chowk,25.4368,81.8341,5500,estimate,Historic old-city market around the Clock Tower,1.54,Mid-range
+Daraganj,25.433,81.883,5200,estimate,"Oldest suburb, on the Ganga bank near Sangam",4.33,Affordable
+Naini,25.396,81.87,5200,listing,"Across the Yamuna, mid-segment and fast developing",6.38,Affordable
+Dhoomanganj,25.473,81.857,5000,estimate,"Good rental yields, dense residential area",3.11,Affordable
+Subedarganj,25.448,81.813,5000,estimate,"West side, near Subedarganj station",3.03,Affordable
+Kydganj,25.437,81.856,4800,estimate,Densely populated central locality,1.77,Affordable
+Alopibagh,25.429,81.864,4400,estimate,"Near Alopi Devi Mandir, close to Sangam",2.97,Affordable
+Muthiganj,25.43,81.843,4200,estimate,Old-city locality,2.0,Affordable
+Jhalwa,25.37,81.85,4200,listing,"Affordable, popular with students and professionals",8.7,Affordable
+Bamrauli,25.44,81.775,4000,listing,West side near Prayagraj airport,6.91,Affordable
+Jhunsi,25.43,81.93,3600,estimate,"Large township on the Ganga bank, east of Sangam",8.94,Affordable

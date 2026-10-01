@@ -11,37 +11,56 @@
     "is_new",
     "garage",
     "garden",
-    "pool",
+    "lift",
     "near_school"
   ],
   "feature_cols_categorical": [
     "location"
   ],
   "locations": [
-    "City Center",
-    "Downtown",
-    "Rural",
-    "Suburb",
-    "Uptown"
+    "Allahpur",
+    "Alopibagh",
+    "Ashok Nagar",
+    "Bamrauli",
+    "Chowk",
+    "Civil Lines",
+    "Colonelganj",
+    "Daraganj",
+    "Dhoomanganj",
+    "George Town",
+    "Jhalwa",
+    "Jhunsi",
+    "Katra",
+    "Kydganj",
+    "Lukerganj",
+    "Mumfordganj",
+    "Muthiganj",
+    "Naini",
+    "Phaphamau",
+    "Stanley Road",
+    "Subedarganj",
+    "Sulem Sarai",
+    "Tagore Town",
+    "Teliyarganj"
   ],
   "metrics": {
     "Linear Regression": {
-      "MAE": 23479.222157102366,
-      "MSE": 1547565892.3616235,
-      "RMSE": 39339.11402613973,
-      "R2": 0.9028404609666266
+      "MAE": 1023108.0300032918,
+      "MSE": 2805344665710.7114,
+      "RMSE": 1674916.3160321508,
+      "R2": 0.8868879736768374
     },
     "Random Forest": {
-      "MAE": 22606.946392321057,
-      "MSE": 1477690155.8161428,
-      "RMSE": 38440.735630527975,
-      "R2": 0.9072274110705838
+      "MAE": 931324.0505706088,
+      "MSE": 1919603607353.2576,
+      "RMSE": 1385497.602795926,
+      "R2": 0.9226012202996199
     },
     "XGBoost": {
-      "MAE": 20830.3173046875,
-      "MSE": 1392678621.9089596,
-      "RMSE": 37318.60959238647,
-      "R2": 0.9125646193198154
+      "MAE": 708070.0858333333,
+      "MSE": 2051215598563.2246,
+      "RMSE": 1432206.548848044,
+      "R2": 0.9172945999772952
     }
   }
 }
