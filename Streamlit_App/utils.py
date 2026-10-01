@@ -324,7 +324,11 @@ div[class*="st-key-card_"] {{ background:#fff; border:3px solid {INK}; box-shado
 [data-baseweb="popover"] li, [data-baseweb="popover"] ul {{ background:#fff !important; color:{INK} !important; font-weight:600; }}
 [data-testid="stCheckbox"] label p {{ font-weight:700 !important; font-size:0.82rem !important; text-transform:none; letter-spacing:0; }}
 [data-baseweb="checkbox"] > span:first-child {{ border:3px solid {INK} !important; border-radius:0 !important; background:#fff !important; }}
-[data-baseweb="checkbox"] input:checked + div, [data-baseweb="checkbox"][aria-checked="true"] > span:first-child {{ background:{INK} !important; }}
+[data-baseweb="checkbox"]:has(input:checked) > span:first-child {{ background:{BLUE} !important; }}
+.st-key-f_within [data-baseweb="checkbox"]:has(input:checked) > span:first-child {{ background:{GREEN} !important; }}
+.st-key-f_stretch [data-baseweb="checkbox"]:has(input:checked) > span:first-child {{ background:{YELLOW} !important; }}
+.st-key-f_over [data-baseweb="checkbox"]:has(input:checked) > span:first-child {{ background:{RED} !important; }}
+[data-baseweb="checkbox"] svg {{ fill:{INK} !important; color:{INK} !important; }}
 [data-testid="stSlider"] [role="slider"] {{ background:{INK} !important; border:3px solid {INK} !important; border-radius:0 !important; box-shadow:2px 2px 0 {PINK} !important; }}
 [data-testid="stSlider"] [data-testid="stSliderThumbValue"], [data-testid="stSliderTickBarMin"], [data-testid="stSliderTickBarMax"] {{ color:{INK} !important; font-family:'Space Mono',monospace; font-weight:700; }}
 
