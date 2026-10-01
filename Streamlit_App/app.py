@@ -354,6 +354,71 @@ with tab_map:
                 else:
                     st.markdown("Your house appears here after the estimate is revealed.")
 
+        # --- EMI calculator + rent vs buy ----------------------------------
+        with st.container(key="card_emi"):
+            st.markdown('<div class="card-title">EMI calculator and rent vs buy</div>', unsafe_allow_html=True)
+            if st.session_state["has_predicted"]:
+                m1, m2, m3 = st.columns(3)
+                with m1:
+                    down_pct = st.slider("Down payment (%)", 0, 90, 20, step=5, key="emi_down")
+                with m2:
+                    rate_pa = st.number_input("Interest rate (% per year)", 5.0, 15.0, 8.75, step=0.05, key="emi_rate")
+                with m3:
+                    years = st.slider("Loan years", 5, 30, 20, key="emi_years")
+
+                down_amt = est * down_pct / 100
+                loan = est - down_amt
+                mr = rate_pa / 12 / 100          # monthly rate
+                n = years * 12                   # number of EMIs
+                emi = loan / n if mr == 0 else loan * mr * (1 + mr) ** n / ((1 + mr) ** n - 1)
+                total_interest = emi * n - loan
+
+                c_a, c_b, c_c = st.columns(3)
+                for col, (label, value) in zip([c_a, c_b, c_c], [
+                    ("Monthly EMI", format_inr(emi)),
+                    ("Loan amount", short_inr(loan)),
+                    ("Total interest", short_inr(total_interest)),
+                ]):
+                    col.markdown(f'<div class="kpi"><div class="kpi-label">{label}</div>'
+                                 f'<div class="kpi-value">{value}</div></div>', unsafe_allow_html=True)
+
+                st.markdown('<div class="panel-sub">Rent vs buy</div>', unsafe_allow_html=True)
+                r1, r2 = st.columns(2)
+                with r1:
+                    yield_pct = st.slider("Rental yield (% of price per year)", 1.5, 5.0, 3.0, step=0.1, key="rb_yield")
+                with r2:
+                    growth = st.slider("Yearly price and rent growth (%)", 0.0, 10.0, 5.0, step=0.5, key="rb_growth")
+
+                rent = est * yield_pct / 100 / 12
+                g = growth / 100
+                breakeven = None
+                for t in range(1, 31):
+                    k = t * 12
+                    if k >= n:
+                        bal = 0
+                    elif mr == 0:
+                        bal = loan - emi * k
+                    else:
+                        bal = loan * (1 + mr) ** k - emi * ((1 + mr) ** k - 1) / mr
+                    paid = emi * min(k, n)
+                    home_value = est * (1 + g) ** t
+                    buy_cost = down_amt + paid - (home_value - bal)   # money spent minus equity owned
+                    rent_cost = sum(rent * 12 * (1 + g) ** y for y in range(t))
+                    if buy_cost <= rent_cost:
+                        breakeven = t
+                        break
+
+                d1, d2 = st.columns(2)
+                d1.markdown(f'<div class="kpi"><div class="kpi-label">Estimated monthly rent</div>'
+                            f'<div class="kpi-value">{format_inr(rent)}</div></div>', unsafe_allow_html=True)
+                d2.markdown(f'<div class="kpi"><div class="kpi-label">Buying beats renting after</div>'
+                            f'<div class="kpi-value">{f"{breakeven} years" if breakeven else "30+ years"}</div></div>',
+                            unsafe_allow_html=True)
+                st.caption("Simple estimate: it ignores taxes, maintenance and what your down payment could earn elsewhere. "
+                           "Rental yield and growth are assumptions you can change above.")
+            else:
+                st.markdown("Press **Reveal my estimate** first, then set your loan details here.")
+
         with st.container(key="card_afford"):
             st.markdown('<div class="card-title">Where can you buy this home? (all Prayagraj localities)</div>', unsafe_allow_html=True)
             tbl = map_df.sort_values("pred")[["location", "tier", "rate_per_sqft", "pred", "status"]].copy()
