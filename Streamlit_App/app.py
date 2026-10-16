@@ -42,6 +42,12 @@ def suggest_rooms(area_sqft):
     label = f"{beds} BHK large home / bungalow" if beds >= 7 else f"{beds} BHK"
     return {"bedrooms": beds, "bathrooms": baths, "label": label}
 
+def max_rooms(area_sqft):
+    """Most bedrooms / bathrooms that can sensibly fit: ~400 sq ft per bedroom, ~500 per bathroom."""
+    area = max(float(area_sqft), 0.0)
+    return max(1, int(area // 400)), max(1, int(area // 500))
+
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(SCRIPT_DIR, "..", "Model", "house_price_model.pkl")
 META_PATH = os.path.join(SCRIPT_DIR, "..", "Model", "model_metadata.json")
@@ -239,8 +245,9 @@ st.markdown(f"""
 # ---------------------------------------------------------------------------
 def _sync_rooms():
     s = suggest_rooms(st.session_state["in_area"])
-    st.session_state["in_beds"] = min(s["bedrooms"], 30)
-    st.session_state["in_baths"] = min(s["bathrooms"], 30)
+    mb, mt = max_rooms(st.session_state["in_area"])
+    st.session_state["in_beds"] = min(s["bedrooms"], mb)
+    st.session_state["in_baths"] = min(s["bathrooms"], mt)
 
 
 _d = suggest_rooms(1200)
@@ -273,13 +280,21 @@ left, right = st.columns([1, 3], gap="large")
 with left:
     with st.container(key="filters_panel"):
         st.markdown('<div class="panel-title">Your property</div>', unsafe_allow_html=True)
-        area = st.number_input("Area (sq ft)", min_value=MIN_HOME_SQFT, max_value=50000,
+        area = st.number_input("Area (sq ft)", min_value=1, max_value=50000,
                                step=50, key="in_area", on_change=_sync_rooms)
+        valid_main = area >= MIN_HOME_SQFT
+        if not valid_main:
+            st.error(f"A home can't be built in {area} sq ft. Minimum is {MIN_HOME_SQFT} sq ft "
+                     f"(a small studio / 1 RK).")
         sug = suggest_rooms(area)
-        st.caption(f"Typical for this size: {sug['label']}, {sug['bathrooms']} bath")
+        max_b, max_t = max_rooms(area)
+        st.session_state["in_beds"] = min(max(st.session_state["in_beds"], 1), max_b)
+        st.session_state["in_baths"] = min(max(st.session_state["in_baths"], 1), max_t)
+        st.caption(f"Typical for this size: {sug['label']}, {sug['bathrooms']} bath · "
+                   f"max possible: {max_b} bed / {max_t} bath")
         c1, c2 = st.columns(2)
-        beds = c1.number_input("Bedrooms", min_value=1, max_value=30, key="in_beds")
-        baths = c2.number_input("Bathrooms", min_value=1, max_value=30, key="in_baths")
+        beds = c1.number_input("Bedrooms", min_value=1, max_value=max_b, key="in_beds")
+        baths = c2.number_input("Bathrooms", min_value=1, max_value=max_t, key="in_baths")
         age = st.slider("Age of building (years)", 0, 60, key="in_age")
         loc_sel = st.selectbox("Locality", LOC_NAMES, key="in_loc")
 
@@ -295,13 +310,14 @@ with left:
                                  step=100000, key="in_budget")
         st.caption(f"= {short_inr(budget)}")
 
-        st.button("Reveal my estimate", key="btn_reveal", on_click=_reveal, width="stretch")
+        st.button("Reveal my estimate", key="btn_reveal", on_click=_reveal, width="stretch",
+                  disabled=not valid_main)
 
 specs_main = (float(area), int(beds), int(baths), int(age), loc_sel,
               bool(garage), bool(garden), bool(lift), bool(school))
 
 # Live per-locality estimates for the map
-preds = predict_all(float(area), int(beds), int(baths), int(age),
+preds = predict_all(float(max(area, MIN_HOME_SQFT)), int(beds), int(baths), int(age),
                     bool(garage), bool(garden), bool(lift), bool(school))
 map_df = loc_df.copy()
 map_df["pred"] = preds
@@ -312,104 +328,107 @@ map_df["tier"] = [price_tier(p, stats)[0] for p in preds]
 # RIGHT: TABS
 # ---------------------------------------------------------------------------
 with right:
-    tab_map, tab_cmp, tab_ins = st.tabs(["Map", "Compare", "Insights"])
+    tab_map, tab_cmp, tab_ins, tab_emi = st.tabs(["Map", "Compare", "Insights", "EMI calculator"])
 
     # ======================= MAP TAB =======================
     with tab_map:
-        t1, t2, t3, t4, t5 = st.columns([3, 2, 1.2, 1.2, 1.2])
-        find_place = t1.selectbox("Find a place", PLACE_CODES, key="find_place",
-                                  format_func=place_label)
-        visible = t2.multiselect("Show", list(STATUS_META.keys()), default=list(STATUS_META.keys()),
-                                 format_func=lambda s: STATUS_META[s]["label"])
-        show_lm = t3.checkbox("Landmarks", value=True)
-        t4.write("")
-        t4.button("Toggle 3D tilt", key="btn_tilt", on_click=_toggle_tilt, width="stretch")
-        t5.write("")
-        t5.button("Reset view", key="btn_reset", on_click=_reset_view, width="stretch")
-
-        price_main, row_main = predict_one(specs_main)
-        focus_loc = loc_sel if st.session_state["has_predicted"] else None
-        focus_text = short_inr(price_main) if focus_loc else None
-
-        with st.container(key="map_wrap"):
-            fig = build_map(map_df, visible, show_lm, find_place,
-                            st.session_state["tilt"], focus_loc, focus_text)
-            st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
-
-            with st.container(key="legend_card"):
-                st.markdown(
-                    '<div class="lg-title">LEGEND</div>'
-                    + "".join(f'<div class="lg-row"><span class="lg-dot" style="background:{m["color"]}"></span>{m["label"]}</div>'
-                              for m in STATUS_META.values())
-                    + '<div class="lg-row"><span class="lg-sq"></span>Famous place</div>',
-                    unsafe_allow_html=True)
-
-            counts = map_df["status"].value_counts().to_dict()
-            n_w, n_s, n_o = counts.get("within", 0), counts.get("stretch", 0), counts.get("over", 0)
-            tot = max(n_w + n_s + n_o, 1)
-            p1, p2 = n_w / tot * 100, (n_w + n_s) / tot * 100
-            with st.container(key="stats_card"):
-                st.markdown(f"""
-<div class="st-title">YOUR BUDGET {short_inr(budget)}</div>
-<div class="st-grid">
-<div class="st-rows">
-<div class="st-row" style="background:{GREEN}">Within <b>{n_w}</b></div>
-<div class="st-row" style="background:{YELLOW}">Stretch <b>{n_s}</b></div>
-<div class="st-row" style="background:{RED}">Over <b>{n_o}</b></div>
-</div>
-<div class="st-donutbox"><div class="donut" style="background:conic-gradient({GREEN} 0 {p1:.1f}%, {YELLOW} {p1:.1f}% {p2:.1f}%, {RED} {p2:.1f}% 100%)"></div></div>
-</div>
-""", unsafe_allow_html=True)
-
-        if find_place != OVERVIEW:
-            kind, name = find_place.split("::")
-            if kind == "loc":
-                r = loc_row(name)
-                p = float(map_df.loc[map_df["location"] == name, "pred"].iloc[0])
-                st.markdown(f'<div class="place-info"><b>{name}</b> ({r["tier"]}) — {r["note"]}<br>'
-                            f'Base rate ₹{indian_grouping(r["rate_per_sqft"])}/sq ft · '
-                            f'{r["distance_to_city_km"]} km from Civil Lines · '
-                            f'Estimate for your specs: <b>{format_inr(p)}</b></div>', unsafe_allow_html=True)
-            else:
-                r = lm_df[lm_df["name"] == name].iloc[0]
-                st.markdown(f'<div class="place-info"><b>{name}</b> — {r["note"]}<br>'
-                            f'Nearest locality: {r["nearest_locality"]}</div>', unsafe_allow_html=True)
-
-        # ---- estimate result ----
-        if st.session_state["has_predicted"]:
-            loc_info = loc_row(loc_sel)
-            tier_name, tier_lvl = price_tier(price_main, stats)
-            status = budget_status(price_main, budget)
-            traits = get_quality_traits(loc_info["note"], garage, garden, lift, school,
-                                        age, float(loc_info["distance_to_city_km"]))
-            why = explain_price(row_main, stats, float(loc_info["rate_per_sqft"]))
-            rc1, rc2 = st.columns([3, 2])
-            with rc1:
-                with st.container(key="card_result"):
-                    st.markdown('<div class="card-title">Estimated price</div>', unsafe_allow_html=True)
-                    st.markdown(puzzle_reveal_html(format_inr(price_main),
-                                                   f"{tier_name} · {loc_sel} · ≈ ₹{indian_grouping(price_main / area)}/sq ft",
-                                                   key=f"r{st.session_state['reveal_counter']}"),
-                                unsafe_allow_html=True)
-                    st.markdown(f'<span class="win-badge" style="background:{STATUS_META[status]["color"]}">'
-                                f'{STATUS_META[status]["label"]}</span>', unsafe_allow_html=True)
-                    low, high = price_main - best_mae, price_main + best_mae
-                    st.caption(f"Typical model error ±{short_inr(best_mae)} → likely range "
-                               f"{short_inr(max(low, 0))} – {short_inr(high)}")
-                    st.markdown('<div class="panel-sub">Why this estimate</div>', unsafe_allow_html=True)
-                    for b in why:
-                        st.markdown(f"- {b}")
-                    st.markdown("".join(f'<span class="pill">{t}</span>' for t in traits),
-                                unsafe_allow_html=True)
-                    if area > AREA_CAP or beds > BED_CAP or baths > BATH_CAP:
-                        st.caption("Your size is beyond the training data, so the price is scaled up from "
-                                   "the largest homes the model has seen. Treat it as a rough guide.")
-            with rc2:
-                with st.container(key="card_house"):
-                    st.markdown('<div class="card-title">Your home</div>', unsafe_allow_html=True)
-                    st.markdown(render_house_svg(tier_lvl, garage, garden, lift), unsafe_allow_html=True)
+        if not valid_main:
+            st.error(f"Enter an area of at least {MIN_HOME_SQFT} sq ft to see estimates on the map.")
         else:
-            st.info("Set your property details on the left and press **Reveal my estimate**.")
+            t1, t2, t3, t4, t5 = st.columns([3, 2, 1.2, 1.2, 1.2])
+            find_place = t1.selectbox("Find a place", PLACE_CODES, key="find_place",
+                                      format_func=place_label)
+            visible = t2.multiselect("Show", list(STATUS_META.keys()), default=list(STATUS_META.keys()),
+                                     format_func=lambda s: STATUS_META[s]["label"])
+            show_lm = t3.checkbox("Landmarks", value=True)
+            t4.write("")
+            t4.button("Toggle 3D tilt", key="btn_tilt", on_click=_toggle_tilt, width="stretch")
+            t5.write("")
+            t5.button("Reset view", key="btn_reset", on_click=_reset_view, width="stretch")
+
+            price_main, row_main = predict_one(specs_main)
+            focus_loc = loc_sel if st.session_state["has_predicted"] else None
+            focus_text = short_inr(price_main) if focus_loc else None
+
+            with st.container(key="map_wrap"):
+                fig = build_map(map_df, visible, show_lm, find_place,
+                                st.session_state["tilt"], focus_loc, focus_text)
+                st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+
+                with st.container(key="legend_card"):
+                    st.markdown(
+                        '<div class="lg-title">LEGEND</div>'
+                        + "".join(f'<div class="lg-row"><span class="lg-dot" style="background:{m["color"]}"></span>{m["label"]}</div>'
+                                  for m in STATUS_META.values())
+                        + '<div class="lg-row"><span class="lg-sq"></span>Famous place</div>',
+                        unsafe_allow_html=True)
+
+                counts = map_df["status"].value_counts().to_dict()
+                n_w, n_s, n_o = counts.get("within", 0), counts.get("stretch", 0), counts.get("over", 0)
+                tot = max(n_w + n_s + n_o, 1)
+                p1, p2 = n_w / tot * 100, (n_w + n_s) / tot * 100
+                with st.container(key="stats_card"):
+                    st.markdown(f"""
+    <div class="st-title">YOUR BUDGET {short_inr(budget)}</div>
+    <div class="st-grid">
+    <div class="st-rows">
+    <div class="st-row" style="background:{GREEN}">Within <b>{n_w}</b></div>
+    <div class="st-row" style="background:{YELLOW}">Stretch <b>{n_s}</b></div>
+    <div class="st-row" style="background:{RED}">Over <b>{n_o}</b></div>
+    </div>
+    <div class="st-donutbox"><div class="donut" style="background:conic-gradient({GREEN} 0 {p1:.1f}%, {YELLOW} {p1:.1f}% {p2:.1f}%, {RED} {p2:.1f}% 100%)"></div></div>
+    </div>
+    """, unsafe_allow_html=True)
+
+            if find_place != OVERVIEW:
+                kind, name = find_place.split("::")
+                if kind == "loc":
+                    r = loc_row(name)
+                    p = float(map_df.loc[map_df["location"] == name, "pred"].iloc[0])
+                    st.markdown(f'<div class="place-info"><b>{name}</b> ({r["tier"]}) — {r["note"]}<br>'
+                                f'Base rate ₹{indian_grouping(r["rate_per_sqft"])}/sq ft · '
+                                f'{r["distance_to_city_km"]} km from Civil Lines · '
+                                f'Estimate for your specs: <b>{format_inr(p)}</b></div>', unsafe_allow_html=True)
+                else:
+                    r = lm_df[lm_df["name"] == name].iloc[0]
+                    st.markdown(f'<div class="place-info"><b>{name}</b> — {r["note"]}<br>'
+                                f'Nearest locality: {r["nearest_locality"]}</div>', unsafe_allow_html=True)
+
+            # ---- estimate result ----
+            if st.session_state["has_predicted"]:
+                loc_info = loc_row(loc_sel)
+                tier_name, tier_lvl = price_tier(price_main, stats)
+                status = budget_status(price_main, budget)
+                traits = get_quality_traits(loc_info["note"], garage, garden, lift, school,
+                                            age, float(loc_info["distance_to_city_km"]))
+                why = explain_price(row_main, stats, float(loc_info["rate_per_sqft"]))
+                rc1, rc2 = st.columns([3, 2])
+                with rc1:
+                    with st.container(key="card_result"):
+                        st.markdown('<div class="card-title">Estimated price</div>', unsafe_allow_html=True)
+                        st.markdown(puzzle_reveal_html(format_inr(price_main),
+                                                       f"{tier_name} · {loc_sel} · ≈ ₹{indian_grouping(price_main / area)}/sq ft",
+                                                       key=f"r{st.session_state['reveal_counter']}"),
+                                    unsafe_allow_html=True)
+                        st.markdown(f'<span class="win-badge" style="background:{STATUS_META[status]["color"]}">'
+                                    f'{STATUS_META[status]["label"]}</span>', unsafe_allow_html=True)
+                        low, high = price_main - best_mae, price_main + best_mae
+                        st.caption(f"Typical model error ±{short_inr(best_mae)} → likely range "
+                                   f"{short_inr(max(low, 0))} – {short_inr(high)}")
+                        st.markdown('<div class="panel-sub">Why this estimate</div>', unsafe_allow_html=True)
+                        for b in why:
+                            st.markdown(f"- {b}")
+                        st.markdown("".join(f'<span class="pill">{t}</span>' for t in traits),
+                                    unsafe_allow_html=True)
+                        if area > AREA_CAP or beds > BED_CAP or baths > BATH_CAP:
+                            st.caption("Your size is beyond the training data, so the price is scaled up from "
+                                       "the largest homes the model has seen. Treat it as a rough guide.")
+                with rc2:
+                    with st.container(key="card_house"):
+                        st.markdown('<div class="card-title">Your home</div>', unsafe_allow_html=True)
+                        st.markdown(render_house_svg(tier_lvl, garage, garden, lift), unsafe_allow_html=True)
+            else:
+                st.info("Set your property details on the left and press **Reveal my estimate**.")
 
     # ======================= COMPARE TAB =======================
     with tab_cmp:
@@ -417,11 +436,15 @@ with right:
             with st.container(key=f"card_spec_{tag}"):
                 st.markdown(f'<div class="card-title">{title}</div>', unsafe_allow_html=True)
                 loc = st.selectbox("Locality", LOC_NAMES, index=LOC_NAMES.index(defaults["loc"]), key=f"{tag}_loc")
-                ar = st.number_input("Area (sq ft)", MIN_HOME_SQFT, 50000, defaults["area"], 50, key=f"{tag}_area")
+                ar = st.number_input("Area (sq ft)", 1, 50000, defaults["area"], 50, key=f"{tag}_area")
+                if ar < MIN_HOME_SQFT:
+                    st.error(f"Minimum is {MIN_HOME_SQFT} sq ft — nothing liveable fits in {ar} sq ft.")
                 s = suggest_rooms(ar)
+                mb, mt = max_rooms(ar)
+                st.caption(f"Max possible for this size: {mb} bed / {mt} bath")
                 x1, x2 = st.columns(2)
-                bd = x1.number_input("Bedrooms", 1, 30, s["bedrooms"], key=f"{tag}_bed_{ar}")
-                bt = x2.number_input("Bathrooms", 1, 30, s["bathrooms"], key=f"{tag}_bath_{ar}")
+                bd = x1.number_input("Bedrooms", 1, mb, min(s["bedrooms"], mb), key=f"{tag}_bed_{ar}")
+                bt = x2.number_input("Bathrooms", 1, mt, min(s["bathrooms"], mt), key=f"{tag}_bath_{ar}")
                 ag = st.slider("Age (years)", 0, 60, defaults["age"], key=f"{tag}_age")
                 y1, y2 = st.columns(2)
                 g1 = y1.checkbox("Garage", defaults["garage"], key=f"{tag}_garage")
@@ -440,7 +463,9 @@ with right:
 
         st.button("Compare properties", key="cmp_btn", on_click=_reveal_cmp)
 
-        if st.session_state["has_compared"]:
+        if st.session_state["has_compared"] and min(spec_a[0], spec_b[0]) < MIN_HOME_SQFT:
+            st.error(f"Both properties need at least {MIN_HOME_SQFT} sq ft to be compared.")
+        elif st.session_state["has_compared"]:
             pa, _ = predict_one(spec_a)
             pb, _ = predict_one(spec_b)
             ra, rb = st.columns(2, gap="large")
@@ -513,6 +538,79 @@ with right:
 
         with st.expander("Dataset preview"):
             st.dataframe(df.head(50), width="stretch")
+
+    # ======================= EMI TAB =======================
+    with tab_emi:
+        default_price = int(round(price_main, -3)) if valid_main else 5000000
+        e1, e2 = st.columns([1, 2], gap="large")
+        with e1:
+            with st.container(key="card_emi_in"):
+                st.markdown('<div class="card-title">Loan details</div>', unsafe_allow_html=True)
+                if not valid_main:
+                    st.warning("Enter a valid area on the left to start from your estimated price.")
+                price_in = st.number_input("Property price (₹)", min_value=100000, max_value=1000000000,
+                                           value=max(default_price, 100000), step=100000, key="emi_price")
+                down_pct = st.slider("Down payment (%)", 0, 90, 20, key="emi_down")
+                rate = st.slider("Interest rate (% per year)", 5.0, 15.0, 8.5, 0.05, key="emi_rate")
+                years = st.slider("Tenure (years)", 1, 30, 20, key="emi_years")
+                income = st.number_input("Monthly income (₹, optional)", min_value=0, value=0,
+                                         step=5000, key="emi_income")
+
+        down = price_in * down_pct / 100
+        loan = price_in - down
+        n = years * 12
+        r = rate / 12 / 100
+        emi_val = loan / n if r == 0 else loan * r * (1 + r) ** n / ((1 + r) ** n - 1)
+        total_pay = emi_val * n
+        total_int = total_pay - loan
+
+        with e2:
+            k1, k2, k3, k4 = st.columns(4)
+            for col, label, val in (
+                (k1, "Monthly EMI", format_inr(emi_val)),
+                (k2, "Loan amount", short_inr(loan)),
+                (k3, "Total interest", short_inr(total_int)),
+                (k4, "Total payable", short_inr(total_pay))):
+                col.markdown(f'<div class="kpi"><div class="kpi-label">{label}</div>'
+                             f'<div class="kpi-value" style="font-size:1.05rem">{val}</div></div>',
+                             unsafe_allow_html=True)
+
+            if income > 0:
+                ratio = emi_val / income * 100
+                msg = (f"EMI is <b>{ratio:.0f}%</b> of your monthly income. "
+                       + ("Comfortable (under 40%)." if ratio <= 40 else
+                          "High — lenders usually prefer EMI under 40-50% of income."))
+                st.markdown(f'<div class="callout">{msg}</div>', unsafe_allow_html=True)
+            if price_in > budget:
+                st.markdown(f'<div class="callout">This price is {short_inr(price_in - budget)} above your '
+                            f'budget of {short_inr(budget)}. A larger down payment may help.</div>',
+                            unsafe_allow_html=True)
+
+            g1, g2 = st.columns(2)
+            with g1:
+                with st.container(key="card_emi_pie"):
+                    st.markdown('<div class="card-title">Where your money goes</div>', unsafe_allow_html=True)
+                    pie = px.pie(names=["Down payment", "Loan principal", "Interest"],
+                                 values=[down, loan, total_int], hole=0.5,
+                                 color_discrete_sequence=[TEAL, BLUE, PINK])
+                    pie.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0), paper_bgcolor="rgba(0,0,0,0)")
+                    st.plotly_chart(pie, width="stretch")
+            with g2:
+                with st.container(key="card_emi_bal"):
+                    st.markdown('<div class="card-title">Outstanding loan by year</div>', unsafe_allow_html=True)
+                    bal, rows = loan, [(0, loan)]
+                    for y in range(1, years + 1):
+                        for _ in range(12):
+                            bal = bal * (1 + r) - emi_val
+                        rows.append((y, max(bal, 0)))
+                    bal_df = pd.DataFrame(rows, columns=["Year", "Balance"])
+                    ln = px.area(bal_df, x="Year", y="Balance", color_discrete_sequence=[BLUE])
+                    ln.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0), paper_bgcolor="rgba(0,0,0,0)",
+                                     plot_bgcolor="#fff", yaxis_title="₹ outstanding")
+                    st.plotly_chart(ln, width="stretch")
+            st.caption("EMI = P × r × (1+r)ⁿ / ((1+r)ⁿ − 1), r = monthly rate, n = months. "
+                       "Indicative only — banks add processing fees and may change rates.")
+
 
 st.caption(f"HomeValue AI · {best_model_name} model trained on a synthetic Prayagraj dataset · "
            f"{datetime.date.today().year} · estimates are indicative, not valuations.")
