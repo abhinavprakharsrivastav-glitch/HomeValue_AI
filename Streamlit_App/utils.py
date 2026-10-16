@@ -1,37 +1,28 @@
 """
-utils.py — HomeValue AI (Prayagraj edition)
-Helpers: rupee formatting, distance, budget status, rule-based explanations,
-parametric SVG house, puzzle price reveal and the neo-brutalist theme CSS.
-All prices are in Indian Rupees (the dataset is already in Rs).
+utils.py — HomeValue AI
+Helper functions: currency formatting, Indian locality mapping,
+rule-based "why this price" explanations, parametric SVG house
+illustration, animated particle/constellation background, and
+theme (dark/light) CSS generation.
 """
 
-import math
 import random
-
-CITY_CENTRE = (25.4480, 81.8432)  # Civil Lines, used as "city centre"
-
-# Palette (matches the dashboard reference)
-INK = "#111111"
-YELLOW = "#F4C430"
-PINK = "#F28AB2"
-TEAL = "#5FD3C4"
-BLUE = "#3D7BD9"
-GREEN = "#2FBF5E"
-RED = "#E8553A"
-CREAM = "#FFF6DC"
-
-STATUS_META = {
-    "within":  {"label": "Within budget",        "color": GREEN},
-    "stretch": {"label": "Stretch (up to +25%)", "color": YELLOW},
-    "over":    {"label": "Over budget",          "color": RED},
-}
-
 
 # ---------------------------------------------------------------------------
 # CURRENCY
 # ---------------------------------------------------------------------------
-def indian_grouping(n) -> str:
-    """12,34,567 style digit grouping."""
+# The bundled dataset is a synthetic training set with prices in USD.
+# We apply a fixed, clearly-labelled conversion rate to present every
+# figure in Indian Rupees. Change USD_TO_INR if you want a different rate.
+USD_TO_INR = 83.0
+
+
+def usd_to_inr(usd_amount: float) -> float:
+    return usd_amount * USD_TO_INR
+
+
+def indian_grouping(n: int) -> str:
+    """Format an integer with Indian digit grouping (e.g. 12,34,567)."""
     s = str(int(n))
     if len(s) <= 3:
         return s
@@ -45,41 +36,239 @@ def indian_grouping(n) -> str:
     return ",".join(parts) + "," + tail
 
 
-def format_inr(amount: float) -> str:
-    return f"₹{indian_grouping(round(amount))}"
+def format_inr(usd_amount: float, short: bool = False) -> str:
+    """Full Indian-formatted rupee string, e.g. ₹2,73,10,483."""
+    inr = usd_to_inr(usd_amount)
+    if short:
+        return short_inr(usd_amount)
+    return f"₹{indian_grouping(round(inr))}"
 
 
-def short_inr(amount: float) -> str:
-    if amount >= 1_00_00_000:
-        return f"₹{amount / 1_00_00_000:.2f} Cr"
-    if amount >= 1_00_000:
-        return f"₹{amount / 1_00_000:.1f} L"
-    return f"₹{indian_grouping(round(amount))}"
-
-
-# ---------------------------------------------------------------------------
-# GEO
-# ---------------------------------------------------------------------------
-def haversine_km(lat1, lon1, lat2, lon2) -> float:
-    r = 6371.0
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dphi = p2 - p1
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * r * math.asin(math.sqrt(a))
+def short_inr(usd_amount: float) -> str:
+    """Compact Lakh / Crore style, e.g. ₹1.24 Cr or ₹42.3 L."""
+    inr = usd_to_inr(usd_amount)
+    if inr >= 1_00_00_000:
+        return f"₹{inr / 1_00_00_000:.2f} Cr"
+    if inr >= 1_00_000:
+        return f"₹{inr / 1_00_000:.2f} L"
+    return f"₹{indian_grouping(round(inr))}"
 
 
 # ---------------------------------------------------------------------------
-# BUDGET STATUS / PRICE TIER
+# LAND PLANNER  (land area -> suggested bedrooms & bathrooms)
 # ---------------------------------------------------------------------------
-def budget_status(pred: float, budget: float) -> str:
-    if pred <= budget:
-        return "within"
-    if pred <= budget * 1.25:
-        return "stretch"
-    return "over"
+# The training data has no link between area and room count (correlation ~0),
+# so this is rule-based, using typical Indian residential norms for
+# built-up area per configuration. Output is clamped to the model's trained
+# range (1-6 bedrooms, 1-4 bathrooms) so it can feed the price estimator.
+LAND_UNITS = {
+    "sq ft": 1.0,
+    "sq yards (gaj)": 9.0,
+    "sq metres": 10.7639,
+}
+
+# (min built-up sq ft, bedrooms, bathrooms, label)
+_ROOM_TIERS = [
+    (0,    1, 1, "1 BHK (compact)"),
+    (450,  1, 1, "1 BHK"),
+    (700,  2, 2, "2 BHK"),
+    (1150, 3, 2, "3 BHK (standard)"),
+    (1500, 3, 3, "3 BHK (spacious)"),
+    (2000, 4, 4, "4 BHK"),
+    (3200, 5, 4, "5 BHK"),
+    (4500, 6, 4, "6 BHK"),
+]
 
 
+def to_sqft(value: float, unit: str) -> float:
+    return value * LAND_UNITS.get(unit, 1.0)
+
+
+def _tier_index(built_up_sqft: float) -> int:
+    idx = 0
+    for i, (lo, *_rest) in enumerate(_ROOM_TIERS):
+        if built_up_sqft >= lo:
+            idx = i
+    return idx
+
+
+def suggest_rooms(land_sqft: float, coverage_pct: float = 60, floors: int = 1) -> dict:
+    """Suggest bedrooms/bathrooms from land area.
+
+    built_up = land * ground coverage * floors
+    Returns the recommended layout plus the next-smaller / next-larger
+    layouts as alternatives (e.g. for a more compact or more spacious plan).
+    """
+    built_up = max(land_sqft, 0) * (coverage_pct / 100.0) * floors
+    i = _tier_index(built_up)
+    lo, beds, baths, label = _ROOM_TIERS[i]
+
+    def pack(j):
+        _lo, b, ba, lab = _ROOM_TIERS[j]
+        return {"bedrooms": b, "bathrooms": ba, "label": lab, "min_sqft": _lo}
+
+    alt_compact = pack(i - 1) if i > 0 else None
+    alt_spacious = pack(i + 1) if i < len(_ROOM_TIERS) - 1 else None
+
+    return {
+        "land_sqft": land_sqft,
+        "built_up_sqft": built_up,
+        "bedrooms": beds,
+        "bathrooms": baths,
+        "label": label,
+        "sqft_per_bedroom": built_up / beds if beds else 0,
+        "too_small": built_up < 300,
+        "alt_compact": alt_compact,
+        "alt_spacious": alt_spacious,
+    }
+
+
+# ---------------------------------------------------------------------------
+# INDIAN-STYLE LOCALITY NAMES
+# ---------------------------------------------------------------------------
+# The model was trained on these exact category strings, so we never change
+# the underlying values sent to the model — only how they are displayed.
+LOCATION_DISPLAY = {
+    "City Center": "City Center (CBD)",
+    "Downtown": "Downtown (Old City / Commercial Hub)",
+    "Uptown": "Uptown (Posh Colony)",
+    "Suburb": "Suburb (Residential Township)",
+    "Rural": "Rural / Outskirts",
+}
+LOCATION_ICON = {
+    "City Center": "🏙️",
+    "Downtown": "🏬",
+    "Uptown": "🏡",
+    "Suburb": "🏘️",
+    "Rural": "🌾",
+}
+
+
+def display_locations(locations):
+    return [LOCATION_DISPLAY.get(loc, loc) for loc in locations]
+
+
+def to_raw_location(display_value: str, locations):
+    for loc in locations:
+        if LOCATION_DISPLAY.get(loc, loc) == display_value:
+            return loc
+    return display_value
+
+
+# ---------------------------------------------------------------------------
+# LOCALITY "QUALITY" TRAITS
+# ---------------------------------------------------------------------------
+LOCATION_TRAITS = {
+    "City Center": [
+        "Near markets & shopping hubs",
+        "Excellent metro / bus connectivity",
+        "Close to hospitals & offices",
+    ],
+    "Downtown": [
+        "Heart of commercial activity",
+        "Walking distance to markets & shops",
+        "High rental demand in this pocket",
+    ],
+    "Uptown": [
+        "Premium, low-density neighbourhood",
+        "Gated-community feel, upscale surroundings",
+        "Sought after by premium buyers",
+    ],
+    "Suburb": [
+        "Family-friendly residential township",
+        "More open space & easier parking",
+        "Quieter than the city core",
+    ],
+    "Rural": [
+        "Peaceful, low-noise surroundings",
+        "Larger plot potential",
+        "Ideal for a farmhouse-style home",
+    ],
+}
+
+
+def get_quality_traits(location, garage, garden, pool, near_school, age_years, distance_km):
+    traits = list(LOCATION_TRAITS.get(location, []))
+    if garage:
+        traits.append("Dedicated covered parking")
+    if garden:
+        traits.append("Private garden / lawn space")
+    if pool:
+        traits.append("Swimming pool — a premium feature")
+    if near_school:
+        traits.append("Walking distance to a school")
+    if age_years <= 5:
+        traits.append("Newly built — low maintenance expected")
+    elif age_years >= 35:
+        traits.append("Older property — may need some renovation")
+    if distance_km <= 3:
+        traits.append("Very close to the city — high convenience")
+    elif distance_km >= 20:
+        traits.append("Far from the city — more affordable, more peaceful")
+    return traits[:6]
+
+
+# ---------------------------------------------------------------------------
+# RULE-BASED "WHY THIS PRICE" EXPLANATION
+# ---------------------------------------------------------------------------
+def explain_price(inputs: dict, stats: dict):
+    """
+    Produce short bullet points explaining why the estimate is relatively
+    high or low, by comparing the given inputs against dataset statistics.
+    This is a transparent, rule-based explainer (not a formal SHAP
+    decomposition) meant to give an intuitive sense of the main drivers.
+    """
+    bullets = []
+
+    area = inputs["area_sqft"]
+    area_med = stats["area_median"]
+    if area >= area_med * 1.2:
+        bullets.append(f"↑ Larger than a typical home ({area:,.0f} sq ft vs ~{area_med:,.0f} sq ft median) — pushes the price up")
+    elif area <= area_med * 0.8:
+        bullets.append(f"↓ Smaller than a typical home ({area:,.0f} sq ft vs ~{area_med:,.0f} sq ft median) — brings the price down")
+
+    dist = inputs["distance_to_city_km"]
+    if dist <= 3:
+        bullets.append("↑ Very close to the city centre — proximity adds a premium")
+    elif dist >= 18:
+        bullets.append("↓ Located far from the city centre — distance lowers the price")
+
+    age = inputs["age_years"]
+    if age <= 5:
+        bullets.append("↑ Newly built property — recency adds a premium")
+    elif age >= 40:
+        bullets.append("↓ Older property — age brings the price down")
+
+    loc = inputs["location"]
+    premium_locations = {"City Center", "Uptown", "Downtown"}
+    if loc in premium_locations:
+        bullets.append(f"↑ {LOCATION_DISPLAY.get(loc, loc)} is a premium locality — location adds significant value")
+    else:
+        bullets.append(f"↓ {LOCATION_DISPLAY.get(loc, loc)} is a more affordable locality — keeps the price moderate")
+
+    amenity_score = int(inputs["garage"]) + int(inputs["garden"]) + int(inputs["pool"]) + int(inputs["near_school"])
+    if inputs["pool"]:
+        bullets.append("↑ Private pool is a high-value amenity")
+    if amenity_score >= 3:
+        bullets.append(f"↑ {amenity_score}/4 amenities present — extra features add to the estimate")
+    elif amenity_score <= 1:
+        bullets.append(f"↓ Only {amenity_score}/4 amenities present — fewer features keep the estimate lower")
+
+    rooms = inputs["bedrooms"] + inputs["bathrooms"]
+    if rooms >= 8:
+        bullets.append(f"↑ {inputs['bedrooms']} bedrooms + {inputs['bathrooms']} bathrooms is spacious — more rooms add value")
+    elif rooms <= 3:
+        bullets.append(f"↓ Compact layout ({inputs['bedrooms']} bed / {inputs['bathrooms']} bath) — fewer rooms keep the price lower")
+
+    if not bullets:
+        bullets.append("This home sits close to the dataset average on most factors — a fairly typical estimate")
+
+    return bullets[:6]
+
+
+# ---------------------------------------------------------------------------
+# PRICE TIER (for the house illustration + labelling)
+# ---------------------------------------------------------------------------
 def price_tier(prediction, stats):
     q = stats["price_quantiles"]
     if prediction < q[0.25]:
@@ -90,273 +279,478 @@ def price_tier(prediction, stats):
         return "Comfort Home", 3
     if prediction < q[0.90]:
         return "Premium Home", 4
-    return "Luxury Home", 5
+    return "Luxury Villa", 5
 
 
 # ---------------------------------------------------------------------------
-# TRAITS + EXPLANATION
+# PARAMETRIC HOUSE SVG (no external images / internet needed)
 # ---------------------------------------------------------------------------
-def get_quality_traits(note, garage, garden, lift, near_school, age_years, distance_km):
-    traits = [note]
-    if garage:
-        traits.append("Dedicated parking")
-    if garden:
-        traits.append("Garden / lawn space")
-    if lift:
-        traits.append("Lift in the building")
-    if near_school:
-        traits.append("School within walking distance")
-    if age_years <= 5:
-        traits.append("Newly built, low maintenance")
-    elif age_years >= 35:
-        traits.append("Older property, may need renovation")
-    if distance_km <= 2:
-        traits.append("Very close to Civil Lines")
-    elif distance_km >= 8:
-        traits.append("Far from the city centre, quieter")
-    return traits[:6]
+def render_house_svg(tier_level, garage, garden, pool, uptown_gate, dark_mode=True):
+    """Build a small parametric SVG house that scales in complexity with
+    the price tier (1=budget .. 5=luxury) and reflects chosen amenities."""
 
-
-def explain_price(inputs: dict, stats: dict, loc_rate: float):
-    """Transparent rule-based 'why this price' bullets (not SHAP)."""
-    bullets = []
-    area, med = inputs["area_sqft"], stats["area_median"]
-    if area >= med * 1.25:
-        bullets.append(f"↑ Bigger than a typical home ({area:,.0f} vs ~{med:,.0f} sq ft median)")
-    elif area <= med * 0.75:
-        bullets.append(f"↓ Smaller than a typical home ({area:,.0f} vs ~{med:,.0f} sq ft median)")
-
-    rate_med = stats["rate_median"]
-    if loc_rate >= rate_med * 1.25:
-        bullets.append(f"↑ {inputs['location']} is a premium locality (about ₹{loc_rate:,.0f}/sq ft vs ₹{rate_med:,.0f} city median)")
-    elif loc_rate <= rate_med * 0.8:
-        bullets.append(f"↓ {inputs['location']} is an affordable locality (about ₹{loc_rate:,.0f}/sq ft vs ₹{rate_med:,.0f} city median)")
-    else:
-        bullets.append(f"→ {inputs['location']} is priced close to the city median (about ₹{loc_rate:,.0f}/sq ft)")
-
-    age = inputs["age_years"]
-    if age <= 5:
-        bullets.append("↑ New construction adds a premium")
-    elif age >= 30:
-        bullets.append("↓ Older building brings the price down")
-
-    d = inputs["distance_to_city_km"]
-    if d <= 2:
-        bullets.append("↑ Within 2 km of Civil Lines")
-    elif d >= 8:
-        bullets.append("↓ More than 8 km from Civil Lines")
-
-    n_amen = inputs["garage"] + inputs["garden"] + inputs["lift"] + inputs["near_school"]
-    if n_amen >= 3:
-        bullets.append(f"↑ {n_amen}/4 amenities present")
-    elif n_amen <= 1:
-        bullets.append(f"↓ Only {n_amen}/4 amenities present")
-
-    return bullets[:6]
-
-
-# ---------------------------------------------------------------------------
-# PARAMETRIC HOUSE SVG
-# ---------------------------------------------------------------------------
-def render_house_svg(tier_level, garage, garden, lift):
-    wall_colors = ["#D9B78F", "#E0BE86", "#E8C67C", "#F0CE72", "#F4D667"]
-    roof_colors = ["#8A5A3C", "#9A5A36", "#A9522F", "#B8482B", "#C63F27"]
-    wall, roof = wall_colors[tier_level - 1], roof_colors[tier_level - 1]
+    sky_top = "#0A1F38" if dark_mode else "#BFE3F5"
+    sky_bot = "#16283A" if dark_mode else "#EAF6FF"
+    ground = "#1B3A2E" if dark_mode else "#BEE3C6"
+    wall_colors = ["#8E7A63", "#A9906F", "#C7A76C", "#D9B672", "#E7C873"]
+    roof_colors = ["#5A3A2A", "#6E4530", "#7C4A2A", "#8B3E2A", "#A13B2A"]
+    wall = wall_colors[tier_level - 1]
+    roof = roof_colors[tier_level - 1]
+    gold = "#E3B23C"
     two_story = tier_level >= 4
     win_rows = 2 if two_story else 1
     win_cols = 3 if tier_level >= 3 else 2
 
     W, H = 340, 220
     house_w = 150 + tier_level * 12
-    house_h = 130 if two_story else 90
-    hx = (W - house_w) / 2
-    hy = 150 - house_h
+    house_h = 90 if not two_story else 130
+    house_x = (W - house_w) / 2
+    house_y = 150 - house_h
 
     windows = ""
+    win_w, win_h = 20, 20
     for r in range(win_rows):
         for c in range(win_cols):
-            wx = hx + 14 + c * ((house_w - 28 - 20) / max(win_cols - 1, 1))
-            wy = hy + 14 + r * (house_h / win_rows)
-            windows += (f'<rect x="{wx:.1f}" y="{wy:.1f}" width="20" height="20" fill="#8ED1F2" '
-                        f'stroke="{INK}" stroke-width="2.5"/>'
-                        f'<line x1="{wx+10:.1f}" y1="{wy:.1f}" x2="{wx+10:.1f}" y2="{wy+20:.1f}" stroke="{INK}" stroke-width="1.5"/>')
+            wx = house_x + 14 + c * ((house_w - 28) / max(win_cols - 1, 1)) - win_w / 2
+            wx = house_x + 14 + c * ((house_w - 28 - win_w) / max(win_cols - 1, 1))
+            wy = house_y + 14 + r * (house_h / max(win_rows, 1))
+            windows += (
+                f'<rect x="{wx:.1f}" y="{wy:.1f}" width="{win_w}" height="{win_h}" '
+                f'rx="2" fill="{gold}" opacity="0.85" stroke="#3a2a1a" stroke-width="1.5"/>'
+                f'<line x1="{wx + win_w/2:.1f}" y1="{wy:.1f}" x2="{wx + win_w/2:.1f}" y2="{wy+win_h:.1f}" stroke="#3a2a1a" stroke-width="1"/>'
+            )
 
-    dx, dy_ = hx + house_w / 2 - 13, hy + house_h - 40
-    door = (f'<rect x="{dx:.1f}" y="{dy_:.1f}" width="26" height="40" fill="#7A4A2A" stroke="{INK}" stroke-width="2.5"/>'
-            f'<circle cx="{dx+21:.1f}" cy="{dy_+20:.1f}" r="1.8" fill="{YELLOW}" stroke="{INK}" stroke-width="0.8"/>')
-    roof_svg = (f'<polygon points="{hx-10},{hy} {hx+house_w/2},{hy-45} {hx+house_w+10},{hy}" '
-                f'fill="{roof}" stroke="{INK}" stroke-width="3"/>')
+    door_w, door_h = 26, 40
+    door_x = house_x + house_w / 2 - door_w / 2
+    door_y = house_y + house_h - door_h
+    door = (
+        f'<rect x="{door_x:.1f}" y="{door_y:.1f}" width="{door_w}" height="{door_h}" '
+        f'rx="3" fill="#4A2E1E" stroke="#2B1B10" stroke-width="1.5"/>'
+        f'<circle cx="{door_x + door_w - 5:.1f}" cy="{door_y + door_h/2:.1f}" r="1.6" fill="{gold}"/>'
+    )
+
+    roof_pts = f"{house_x-10},{house_y} {house_x+house_w/2},{house_y-45} {house_x+house_w+10},{house_y}"
+    roof_svg = f'<polygon points="{roof_pts}" fill="{roof}" stroke="#2B1B10" stroke-width="2"/>'
 
     garage_svg = ""
     if garage:
         gw, gh = 55, 55
-        gx, gy = hx - gw + 6, 150 - gh
-        garage_svg = (f'<rect x="{gx:.1f}" y="{gy:.1f}" width="{gw}" height="{gh}" fill="{wall}" stroke="{INK}" stroke-width="2.5"/>'
-                      f'<rect x="{gx+6:.1f}" y="{gy+gh-30:.1f}" width="{gw-12}" height="26" fill="#8A8A8A" stroke="{INK}" stroke-width="2"/>'
-                      f'<polygon points="{gx-4},{gy} {gx+gw/2:.1f},{gy-20} {gx+gw+4},{gy}" fill="{roof}" stroke="{INK}" stroke-width="2.5"/>')
+        gx, gy = house_x - gw + 6, 150 - gh
+        garage_svg = (
+            f'<rect x="{gx:.1f}" y="{gy:.1f}" width="{gw}" height="{gh}" fill="{wall}" stroke="#2B1B10" stroke-width="2"/>'
+            f'<rect x="{gx+6:.1f}" y="{gy+gh-30:.1f}" width="{gw-12}" height="26" rx="2" fill="#5b5049" stroke="#2B1B10" stroke-width="1.5"/>'
+            f'<polygon points="{gx-4},{gy} {gx+gw/2:.1f},{gy-20} {gx+gw+4},{gy}" fill="{roof}" stroke="#2B1B10" stroke-width="1.5"/>'
+        )
 
-    lift_svg = ""
-    if lift:
-        lift_svg = (f'<rect x="{hx+house_w-26:.1f}" y="{hy-62:.1f}" width="22" height="30" fill="#BBBBBB" stroke="{INK}" stroke-width="2.5"/>'
-                    f'<text x="{hx+house_w-15:.1f}" y="{hy-42:.1f}" font-size="8" font-weight="700" text-anchor="middle" fill="{INK}">LIFT</text>')
+    pool_svg = ""
+    if pool:
+        pool_svg = (
+            f'<ellipse cx="{house_x + house_w + 45:.1f}" cy="188" rx="34" ry="14" '
+            f'fill="#3AA6C9" opacity="0.85" stroke="#1c6b85" stroke-width="2"/>'
+            f'<ellipse cx="{house_x + house_w + 45:.1f}" cy="188" rx="24" ry="8" fill="#8EE3F5" opacity="0.6"/>'
+        )
 
     garden_svg = ""
     if garden:
-        for tx in (hx - 34 if not garage else hx - 70, hx + house_w + 24):
-            garden_svg += (f'<rect x="{tx-3:.1f}" y="165" width="6" height="20" fill="#7A4A2A" stroke="{INK}" stroke-width="1.5"/>'
-                           f'<circle cx="{tx:.1f}" cy="158" r="16" fill="#3FAE66" stroke="{INK}" stroke-width="2.5"/>')
+        tree_x = [house_x - 34, house_x + house_w + 20]
+        for tx in tree_x:
+            garden_svg += (
+                f'<rect x="{tx-3:.1f}" y="165" width="6" height="20" fill="#4A2E1E"/>'
+                f'<circle cx="{tx:.1f}" cy="158" r="16" fill="#3E8E5B"/>'
+                f'<circle cx="{tx-9:.1f}" cy="164" r="11" fill="#4CA968"/>'
+                f'<circle cx="{tx+9:.1f}" cy="164" r="11" fill="#4CA968"/>'
+            )
 
     gate_svg = ""
-    if tier_level >= 4:
-        gate_svg = (f'<rect x="20" y="195" width="{W-40}" height="6" fill="#777" stroke="{INK}" stroke-width="1.5"/>'
-                    f'<rect x="20" y="180" width="5" height="21" fill="#777" stroke="{INK}" stroke-width="1.5"/>'
-                    f'<rect x="{W-25}" y="180" width="5" height="21" fill="#777" stroke="{INK}" stroke-width="1.5"/>')
+    if uptown_gate or tier_level >= 4:
+        gate_svg = (
+            f'<rect x="20" y="195" width="{W-40}" height="6" fill="#7a6a52"/>'
+            f'<rect x="20" y="180" width="5" height="21" fill="#7a6a52"/>'
+            f'<rect x="{W-25}" y="180" width="5" height="21" fill="#7a6a52"/>'
+        )
 
-    return f"""
-<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;max-width:360px;border:3px solid {INK};background:#BDE7F7;">
-  <circle cx="290" cy="35" r="16" fill="{YELLOW}" stroke="{INK}" stroke-width="2.5"/>
-  <rect x="0" y="150" width="{W}" height="{H-150}" fill="#9BD98F" stroke="{INK}" stroke-width="2.5"/>
-  {gate_svg}{garden_svg}{garage_svg}{roof_svg}{lift_svg}
-  <rect x="{hx:.1f}" y="{hy:.1f}" width="{house_w}" height="{house_h}" fill="{wall}" stroke="{INK}" stroke-width="3"/>
-  {windows}{door}
+    chimney = ""
+    if tier_level >= 2:
+        chimney = f'<rect x="{house_x+house_w-30:.1f}" y="{house_y-30:.1f}" width="12" height="30" fill="#5a4a3a" stroke="#2B1B10" stroke-width="1.5"/>'
+
+    stars = ""
+    if dark_mode:
+        rnd = random.Random(tier_level * 17)
+        for _ in range(18):
+            sx, sy = rnd.uniform(5, W - 5), rnd.uniform(5, 110)
+            stars += f'<circle cx="{sx:.1f}" cy="{sy:.1f}" r="{rnd.uniform(0.6,1.6):.1f}" fill="#C7ECFB" opacity="{rnd.uniform(0.4,0.9):.2f}"/>'
+
+    sun_moon = (
+        f'<circle cx="285" cy="35" r="16" fill="{"#EAF3FF" if dark_mode else "#FFD34D"}" opacity="0.9"/>'
+    )
+
+    svg = f"""
+<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;max-width:360px;">
+  <defs>
+    <linearGradient id="sky{tier_level}" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="{sky_top}"/>
+      <stop offset="100%" stop-color="{sky_bot}"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="{W}" height="{H}" fill="url(#sky{tier_level})"/>
+  {stars}
+  {sun_moon}
+  <rect x="0" y="150" width="{W}" height="{H-150}" fill="{ground}"/>
+  {gate_svg}
+  {garden_svg}
+  {garage_svg}
+  {roof_svg}
+  <rect x="{house_x:.1f}" y="{house_y:.1f}" width="{house_w}" height="{house_h}" fill="{wall}" stroke="#2B1B10" stroke-width="2.5"/>
+  {chimney}
+  {windows}
+  {door}
+  {pool_svg}
 </svg>
 """
+    return svg
 
 
 # ---------------------------------------------------------------------------
-# PUZZLE PRICE REVEAL
+# PUZZLE-STYLE PRICE REVEAL (CSS tiles that fly apart to reveal the number)
 # ---------------------------------------------------------------------------
-def puzzle_reveal_html(value_text: str, caption_text: str, key: str):
-    tiles, i = "", 0
+def puzzle_reveal_html(value_text: str, caption_text: str, key: str, accent="#E3B23C"):
+    import math
+    tiles = ""
     n_cols, n_rows = 6, 3
+    i = 0
     for r in range(n_rows):
         for c in range(n_cols):
             rnd = random.Random(hash(key) + i)
-            delay = i * 0.045 + rnd.uniform(0, 0.05)
-            ang = random.Random(hash(key) + i + 100).uniform(-140, 140)
-            dx = math.cos(math.radians(ang)) * 140
-            dy = math.sin(math.radians(ang)) * 140
-            tiles += (f'<div class="pt pt-{key}" style="left:{c/n_cols*100:.3f}%; top:{r/n_rows*100:.3f}%; '
-                      f'width:{100/n_cols:.3f}%; height:{100/n_rows:.3f}%; animation-delay:{delay:.3f}s; '
-                      f'--fx:{dx:.1f}px; --fy:{dy:.1f}px; --fr:{ang:.1f}deg;"></div>')
+            delay = (i * 0.045) + rnd.uniform(0, 0.05)
+            angle_deg = random.Random(hash(key) + i + 100).uniform(-140, 140)
+            dist = 140
+            dx = math.cos(math.radians(angle_deg)) * dist
+            dy = math.sin(math.radians(angle_deg)) * dist
+            tiles += (
+                f'<div class="puzzle-tile pt-{key}" style="'
+                f'left:{c/n_cols*100:.3f}%; top:{r/n_rows*100:.3f}%; '
+                f'width:{100/n_cols:.3f}%; height:{100/n_rows:.3f}%; '
+                f'animation-delay:{delay:.3f}s; --fly-x:{dx:.1f}px; --fly-y:{dy:.1f}px; '
+                f'--fly-rot:{angle_deg:.1f}deg;"></div>'
+            )
             i += 1
-    return f"""
-<div class="pz-wrap">
-  <div class="pz-value">{value_text}</div>
-  <div class="pz-caption">{caption_text}</div>
-  <div class="pz-tiles">{tiles}</div>
+
+    html = f"""
+<div class="puzzle-wrap" id="puzzle-{key}">
+  <div class="puzzle-value">{value_text}</div>
+  <div class="puzzle-caption">{caption_text}</div>
+  <div class="puzzle-tiles">{tiles}</div>
 </div>
 <style>
-.pz-wrap {{ position:relative; text-align:center; padding:16px 8px; overflow:hidden; background:#fff;
-           border:3px solid {INK}; box-shadow:4px 4px 0 {INK}; margin-bottom:10px; }}
-.pz-value {{ font-family:'Space Mono',monospace; font-weight:700; font-size:2.3rem; color:{INK}; position:relative; z-index:1; }}
-.pz-caption {{ font-family:'Space Grotesk',sans-serif; font-weight:600; font-size:0.78rem; margin-top:4px; position:relative; z-index:1; }}
-.pz-tiles {{ position:absolute; inset:0; z-index:2; pointer-events:none; }}
-.pt {{ position:absolute; background:{INK}; border:1px solid {YELLOW}; }}
-.pt-{key} {{ animation: fly-{key} 0.7s cubic-bezier(.4,0,.2,1) forwards; }}
-@keyframes fly-{key} {{
-  0%   {{ opacity:1; transform:translate(0,0) rotate(0) scale(1); }}
-  100% {{ opacity:0; transform:translate(var(--fx),var(--fy)) rotate(var(--fr)) scale(0.3); }}
+.puzzle-wrap {{
+    position: relative;
+    text-align: center;
+    padding: 18px 10px;
+    overflow: hidden;
+    border-radius: 10px;
+}}
+.puzzle-value {{
+    font-family: 'Space Grotesk', sans-serif;
+    font-weight: 700;
+    font-size: 2.6rem;
+    color: {accent};
+    letter-spacing: 0.01em;
+    position: relative;
+    z-index: 1;
+}}
+.puzzle-caption {{
+    position: relative;
+    z-index: 1;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75rem;
+    opacity: 0.75;
+    margin-top: 4px;
+}}
+.puzzle-tiles {{
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    pointer-events: none;
+}}
+.pt-{key} {{
+    position: absolute;
+    background: linear-gradient(135deg, #1c3352, #0e1f38);
+    border: 1px solid rgba(142,202,230,0.25);
+    animation: puzzleFly-{key} 0.7s cubic-bezier(.4,0,.2,1) forwards;
+}}
+@keyframes puzzleFly-{key} {{
+    0%   {{ opacity: 1; transform: translate(0,0) rotate(0deg) scale(1); }}
+    100% {{ opacity: 0; transform: translate(var(--fly-x), var(--fly-y)) rotate(var(--fly-rot)) scale(0.3); }}
 }}
 </style>
 """
+    return html
 
 
 # ---------------------------------------------------------------------------
-# NEO-BRUTALIST THEME
+# PARTICLE / STARFIELD BACKGROUND (pure CSS, no JS/iframe needed)
 # ---------------------------------------------------------------------------
-def theme_css():
+def particle_background_css(dark_mode=True):
+    """Build a drifting, twinkling starfield using only CSS box-shadows.
+    Rendered directly via st.markdown (unsafe_allow_html=True) so it lives
+    in the real page DOM - no iframe, no JS, nothing that can be sandboxed
+    or blocked. Three depth layers give a subtle parallax feel."""
+    dot_color = "142,202,230" if dark_mode else "70,120,160"
+
+    def make_layer(n, seed, size, min_op, max_op):
+        rnd = random.Random(seed)
+        shadows = []
+        for _ in range(n):
+            x = rnd.randint(0, 2000)
+            y = rnd.randint(0, 2000)
+            op = round(rnd.uniform(min_op, max_op), 2)
+            shadows.append(f"{x}px {y}px rgba({dot_color},{op})")
+        return ", ".join(shadows)
+
+    layer1 = make_layer(90, 11, 1, 0.25, 0.55)   # far, faint, small
+    layer2 = make_layer(55, 22, 2, 0.35, 0.7)    # mid
+    layer3 = make_layer(28, 33, 3, 0.5, 0.9)     # near, brighter
+
+    html = f"""
+<div class="hva-starfield" aria-hidden="true">
+  <div class="hva-star-layer hva-star-l1"></div>
+  <div class="hva-star-layer hva-star-l2"></div>
+  <div class="hva-star-layer hva-star-l3"></div>
+</div>
+<style>
+.hva-starfield {{
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    overflow: hidden;
+    pointer-events: none;
+}}
+.hva-star-layer {{
+    position: absolute;
+    top: 0; left: 0;
+    width: 2000px; height: 2000px;
+    border-radius: 50%;
+}}
+.hva-star-l1 {{
+    box-shadow: {layer1};
+    width: 1px; height: 1px;
+    animation: hvaDrift1 90s linear infinite;
+}}
+.hva-star-l2 {{
+    box-shadow: {layer2};
+    width: 2px; height: 2px;
+    animation: hvaDrift2 65s linear infinite;
+}}
+.hva-star-l3 {{
+    box-shadow: {layer3};
+    width: 3px; height: 3px;
+    animation: hvaDrift3 40s linear infinite, hvaTwinkle 3.5s ease-in-out infinite alternate;
+}}
+@keyframes hvaDrift1 {{
+    from {{ transform: translate(0, 0); }}
+    to   {{ transform: translate(-400px, 300px); }}
+}}
+@keyframes hvaDrift2 {{
+    from {{ transform: translate(0, 0); }}
+    to   {{ transform: translate(300px, -350px); }}
+}}
+@keyframes hvaDrift3 {{
+    from {{ transform: translate(0, 0); }}
+    to   {{ transform: translate(-250px, -300px); }}
+}}
+@keyframes hvaTwinkle {{
+    from {{ opacity: 0.6; }}
+    to   {{ opacity: 1; }}
+}}
+</style>
+"""
+    return html
+
+
+# ---------------------------------------------------------------------------
+# THEME CSS (dark / light glassmorphism)
+# ---------------------------------------------------------------------------
+def theme_css(dark_mode=True):
+    if dark_mode:
+        bg = "#0A1220"
+        text = "#E8F0F7"
+        muted = "#9FB3C8"
+        glass_bg = "rgba(20, 32, 54, 0.55)"
+        glass_border = "rgba(142, 202, 230, 0.22)"
+        accent = "#8ECAE6"
+        accent2 = "#E3B23C"
+        input_bg = "rgba(255,255,255,0.06)"
+        shadow = "0 8px 32px rgba(0,0,0,0.45)"
+    else:
+        bg = "#F3F6FA"
+        text = "#16283A"
+        muted = "#5A6B7D"
+        glass_bg = "rgba(255, 255, 255, 0.55)"
+        glass_border = "rgba(22, 40, 58, 0.12)"
+        accent = "#1D6FA5"
+        accent2 = "#B9791E"
+        input_bg = "rgba(255,255,255,0.85)"
+        shadow = "0 8px 28px rgba(30,60,90,0.12)"
+
     return f"""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Space+Mono:wght@400;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap');
 
-html, body, [class*="css"], [data-testid="stApp"] {{ font-family:'Space Grotesk',sans-serif; color:{INK}; }}
-[data-testid="stAppViewContainer"], [data-testid="stApp"] {{
-    background-color:{CREAM} !important;
-    background-image: radial-gradient({INK}22 1px, transparent 1px); background-size: 18px 18px;
+:root {{
+    --hva-bg: {bg};
+    --hva-text: {text};
+    --hva-muted: {muted};
+    --hva-glass: {glass_bg};
+    --hva-border: {glass_border};
+    --hva-accent: {accent};
+    --hva-accent2: {accent2};
+    --hva-input: {input_bg};
+    --hva-shadow: {shadow};
 }}
-[data-testid="stHeader"] {{ background:transparent !important; }}
-[data-testid="stSidebar"] {{ display:none; }}
-.block-container {{ padding-top:1.4rem; max-width:1500px; }}
-h1,h2,h3,p,span,label,li {{ color:{INK}; }}
 
-/* ---------- header ---------- */
-.nn-header {{ background:{YELLOW}; border:3px solid {INK}; box-shadow:6px 6px 0 {INK};
-    padding:14px 22px; margin-bottom:22px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; }}
-.nn-title {{ font-weight:700; font-size:1.9rem; margin:0; letter-spacing:0.02em; text-transform:uppercase; }}
-.nn-sub {{ font-family:'Space Mono',monospace; font-size:0.75rem; margin:2px 0 0 0; }}
-.nn-badge {{ background:{INK}; color:{YELLOW} !important; padding:4px 10px; font-family:'Space Mono',monospace; font-size:0.72rem; font-weight:700; }}
+html, body {{
+    background-color: {bg} !important;
+}}
+[data-testid="stAppViewContainer"], [data-testid="stApp"] {{
+    background-color: transparent !important;
+    position: relative;
+    z-index: 1;
+}}
+[data-testid="stHeader"] {{ background: transparent !important; }}
+[data-testid="stSidebar"] {{ display: none; }}
+html, body, [class*="css"] {{ font-family: 'Inter', sans-serif; color: {text}; }}
 
-/* ---------- panels / cards ---------- */
-.st-key-filters_panel {{ background:{YELLOW}; border:3px solid {INK}; box-shadow:6px 6px 0 {INK}; padding:16px 16px 10px 16px; }}
-div[class*="st-key-card_"] {{ background:#fff; border:3px solid {INK}; box-shadow:6px 6px 0 {INK}; padding:14px 16px; margin-bottom:6px; }}
-.panel-title {{ font-weight:700; font-size:1.05rem; letter-spacing:0.08em; text-transform:uppercase;
-    border-bottom:3px solid {INK}; padding-bottom:6px; margin-bottom:10px; }}
-.panel-sub {{ font-weight:700; font-size:0.78rem; letter-spacing:0.1em; text-transform:uppercase;
-    margin:12px 0 4px 0; border-bottom:2px solid {INK}; padding-bottom:2px; }}
-.card-title {{ font-weight:700; font-size:0.85rem; letter-spacing:0.12em; text-transform:uppercase;
-    border-bottom:3px solid {INK}; padding-bottom:5px; margin-bottom:10px; }}
+@keyframes fadeUp {{ from {{ opacity: 0; transform: translateY(14px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+@keyframes glowPulse {{
+    0%, 100% {{ box-shadow: 0 0 12px rgba(142,202,230,0.25); }}
+    50% {{ box-shadow: 0 0 26px rgba(142,202,230,0.45); }}
+}}
+@keyframes goldPulse {{
+    0%, 100% {{ box-shadow: 0 0 16px rgba(227,178,60,0.45), 0 0 2px rgba(227,178,60,0.6); }}
+    50% {{ box-shadow: 0 0 30px rgba(227,178,60,0.75), 0 0 6px rgba(227,178,60,0.8); }}
+}}
+@keyframes slideInImg {{
+    from {{ opacity: 0; transform: translateX(30px) scale(0.94); }}
+    to   {{ opacity: 1; transform: translateX(0) scale(1); }}
+}}
+@keyframes flashPop {{
+    0%   {{ filter: brightness(2.4); opacity: 0; transform: scale(0.9); }}
+    40%  {{ filter: brightness(1.5); opacity: 1; }}
+    100% {{ filter: brightness(1); opacity: 1; transform: scale(1); }}
+}}
 
-/* ---------- map frame + overlay cards ---------- */
-.st-key-map_wrap {{ position:relative; background:{TEAL}; border:3px solid {INK}; box-shadow:8px 8px 0 {INK}; padding:10px; }}
-.st-key-legend_card {{ position:absolute !important; top:24px; right:24px; width:215px !important; z-index:50;
-    background:{PINK}; border:3px solid {INK}; box-shadow:4px 4px 0 {INK}; padding:8px 12px 18px 12px; }}
-.st-key-stats_card {{ position:absolute !important; right:24px; bottom:26px; width:250px !important; z-index:50;
-    background:{TEAL}; border:3px solid {INK}; box-shadow:4px 4px 0 {INK}; padding:8px 10px; }}
-.lg-title, .st-title {{ font-weight:700; font-size:0.8rem; letter-spacing:0.1em; border-bottom:2px solid {INK}; margin-bottom:6px; padding-bottom:2px; }}
-.lg-row {{ display:flex; align-items:center; gap:8px; font-size:0.74rem; font-weight:600; margin:3px 0; }}
-.lg-dot {{ width:13px; height:13px; border-radius:50%; border:2px solid {INK}; display:inline-block; flex:none; }}
-.lg-sq {{ width:12px; height:12px; border:2px solid {INK}; background:{BLUE}; display:inline-block; flex:none; }}
-.st-grid {{ display:flex; gap:8px; }}
-.st-rows {{ flex:1; }}
-.st-row {{ display:flex; justify-content:space-between; align-items:center; border:2px solid {INK}; padding:2px 8px;
-    margin:4px 0; font-weight:700; font-size:0.74rem; box-shadow:2px 2px 0 {INK}; }}
-.st-row b {{ font-family:'Space Mono',monospace; font-size:0.95rem; }}
-.st-donutbox {{ width:78px; background:{YELLOW}; border:2px solid {INK}; box-shadow:2px 2px 0 {INK}; display:flex; align-items:center; justify-content:center; padding:4px; }}
-.donut {{ width:58px; height:58px; border-radius:50%; border:2px solid {INK}; position:relative; }}
-.donut::after {{ content:''; position:absolute; inset:14px; background:{YELLOW}; border:2px solid {INK}; border-radius:50%; }}
+/* Glass header */
+.hva-header {{
+    border: 1px solid var(--hva-border);
+    border-radius: 16px;
+    padding: 20px 28px;
+    margin-bottom: 24px;
+    display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;
+    background: var(--hva-glass);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    box-shadow: var(--hva-shadow);
+    animation: fadeUp 0.5s ease;
+}}
+.hva-title {{
+    font-family: 'Space Grotesk', sans-serif;
+    font-weight: 700; font-size: 2rem; margin: 0;
+    background: linear-gradient(90deg, var(--hva-accent), var(--hva-accent2));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+}}
+.hva-subtitle {{
+    font-family: 'JetBrains Mono', monospace; font-size: 0.78rem;
+    color: var(--hva-muted); letter-spacing: 0.06em; margin-top: 4px;
+}}
 
-/* ---------- inputs ---------- */
-[data-testid="stWidgetLabel"] p {{ font-weight:700 !important; font-size:0.78rem !important; text-transform:uppercase; letter-spacing:0.06em; }}
-[data-baseweb="input"], [data-baseweb="select"] > div {{ border:3px solid {INK} !important; border-radius:0 !important; background:#fff !important; }}
-[data-baseweb="base-input"] {{ background:#fff !important; }}
-[data-testid="stNumberInput"] input, [data-baseweb="select"] div {{ color:{INK} !important; font-weight:600; }}
-[data-baseweb="popover"] li, [data-baseweb="popover"] ul {{ background:#fff !important; color:{INK} !important; font-weight:600; }}
-[data-testid="stCheckbox"] label p {{ font-weight:700 !important; font-size:0.82rem !important; text-transform:none; letter-spacing:0; }}
-[data-baseweb="checkbox"] > span:first-child {{ border:3px solid {INK} !important; border-radius:0 !important; background:#fff !important; }}
-[data-baseweb="checkbox"]:has(input:checked) > span:first-child {{ background:{BLUE} !important; }}
-.st-key-f_within [data-baseweb="checkbox"]:has(input:checked) > span:first-child {{ background:{GREEN} !important; }}
-.st-key-f_stretch [data-baseweb="checkbox"]:has(input:checked) > span:first-child {{ background:{YELLOW} !important; }}
-.st-key-f_over [data-baseweb="checkbox"]:has(input:checked) > span:first-child {{ background:{RED} !important; }}
-[data-baseweb="checkbox"] svg {{ fill:{INK} !important; color:{INK} !important; }}
-[data-testid="stSlider"] [role="slider"] {{ background:{INK} !important; border:3px solid {INK} !important; border-radius:0 !important; box-shadow:2px 2px 0 {PINK} !important; }}
-[data-testid="stSlider"] [data-testid="stSliderThumbValue"], [data-testid="stSliderTickBarMin"], [data-testid="stSliderTickBarMax"] {{ color:{INK} !important; font-family:'Space Mono',monospace; font-weight:700; }}
+/* Glass cards / containers */
+[data-testid="stVerticalBlockBorderWrapper"] {{
+    background: var(--hva-glass) !important;
+    border: 1px solid var(--hva-border) !important;
+    border-radius: 16px !important;
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    padding: 8px;
+    transition: box-shadow 0.25s ease, transform 0.25s ease;
+    animation: fadeUp 0.6s ease;
+}}
+[data-testid="stVerticalBlockBorderWrapper"]:hover {{
+    box-shadow: var(--hva-shadow), 0 0 18px rgba(142,202,230,0.18);
+    transform: translateY(-2px);
+}}
+[data-testid="stVerticalBlockBorderWrapper"] * {{ color: var(--hva-text); }}
 
-.stButton > button {{ border:3px solid {INK} !important; border-radius:0 !important; font-weight:700 !important; letter-spacing:0.08em;
-    text-transform:uppercase; color:#fff !important; box-shadow:4px 4px 0 {INK}; transition:transform .08s, box-shadow .08s; padding:0.55rem 0.8rem !important; }}
-.stButton > button p {{ color:#fff !important; font-weight:700 !important; }}
-.stButton > button:hover {{ transform:translate(2px,2px); box-shadow:2px 2px 0 {INK}; }}
-.stButton > button:active {{ transform:translate(4px,4px); box-shadow:0 0 0 {INK}; }}
-.st-key-btn_reveal button, .st-key-btn_tilt button, .st-key-cmp_btn button {{ background:{BLUE} !important; }}
-.st-key-btn_reset button {{ background:{GREEN} !important; }}
+.hva-winner {{
+    border: 2px solid var(--hva-accent2) !important;
+    animation: goldPulse 2.2s ease-in-out infinite !important;
+}}
 
-/* ---------- tabs / expander / dataframe ---------- */
-[role="tablist"], [data-baseweb="tab-list"] {{ gap:8px; border-bottom:3px solid {INK} !important; }}
-[role="tab"] {{ background:#fff !important; border:3px solid {INK} !important; border-bottom:none !important; border-radius:0 !important;
-    padding:6px 16px !important; height:auto !important; margin-right:6px; }}
-[role="tab"][aria-selected="true"] {{ background:{YELLOW} !important; }}
-[role="tab"] p {{ font-weight:700 !important; text-transform:uppercase; letter-spacing:0.06em; font-size:0.85rem !important; }}
-.react-aria-SelectionIndicator, [data-baseweb="tab-highlight"], [data-baseweb="tab-border"] {{ display:none !important; }}
-[data-testid="stExpander"] {{ border:3px solid {INK} !important; border-radius:0 !important; background:#fff !important; }}
-[data-testid="stDataFrame"] {{ border:3px solid {INK}; }}
+.eyebrow {{
+    font-family: 'JetBrains Mono', monospace; font-size: 0.72rem;
+    letter-spacing: 0.14em; text-transform: uppercase; color: var(--hva-accent2);
+    margin-bottom: 8px; border-bottom: 1px dashed var(--hva-border); padding-bottom: 6px;
+}}
 
-/* ---------- small bits ---------- */
-.pill {{ display:inline-block; padding:3px 9px; margin:3px 5px 3px 0; border:2px solid {INK}; background:{CREAM}; font-size:0.72rem; font-weight:600; box-shadow:2px 2px 0 {INK}; }}
-.kpi {{ background:#fff; border:3px solid {INK}; box-shadow:5px 5px 0 {INK}; padding:10px 14px; }}
-.kpi-label {{ font-size:0.68rem; font-weight:700; text-transform:uppercase; letter-spacing:0.1em; }}
-.kpi-value {{ font-family:'Space Mono',monospace; font-weight:700; font-size:1.45rem; }}
-.callout {{ border:3px solid {INK}; background:{PINK}; padding:10px 14px; font-weight:600; font-size:0.9rem; box-shadow:4px 4px 0 {INK}; margin-top:12px; }}
-.place-info {{ border:3px solid {INK}; background:{CREAM}; padding:8px 12px; font-size:0.8rem; font-weight:600; margin-top:8px; box-shadow:3px 3px 0 {INK}; }}
-.win-badge {{ display:inline-block; background:{YELLOW}; border:3px solid {INK}; padding:2px 10px; font-weight:700; box-shadow:3px 3px 0 {INK}; }}
+/* Inputs */
+[data-testid="stNumberInput"] input,
+[data-testid="stSelectbox"] div[data-baseweb="select"] > div,
+[data-testid="stTextInput"] input {{
+    background: var(--hva-input) !important;
+    border: 1px solid var(--hva-border) !important;
+    border-radius: 8px !important;
+    color: var(--hva-text) !important;
+}}
+[data-testid="stSlider"] [role="slider"] {{ background-color: var(--hva-accent2) !important; box-shadow: 0 0 8px rgba(227,178,60,0.5) !important; }}
+[data-testid="stSlider"] > div > div > div > div {{ background: linear-gradient(90deg, var(--hva-accent), var(--hva-accent2)) !important; }}
+
+/* Buttons */
+.stButton > button {{
+    background: linear-gradient(90deg, var(--hva-accent), var(--hva-accent2)) !important;
+    color: #0A1220 !important;
+    border: none !important;
+    border-radius: 10px !important;
+    font-family: 'Space Grotesk', sans-serif !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.05em;
+    padding: 0.7rem 1rem !important;
+    box-shadow: 0 4px 18px rgba(142,202,230,0.3);
+    transition: all 0.2s ease;
+}}
+.stButton > button:hover {{ transform: translateY(-2px); box-shadow: 0 8px 26px rgba(227,178,60,0.4); }}
+.stButton > button:active {{ transform: translateY(0) scale(0.98); }}
+
+/* KPI sparkline cards */
+.kpi-card {{
+    background: var(--hva-glass); border: 1px solid var(--hva-border); border-radius: 14px;
+    padding: 14px 16px; backdrop-filter: blur(10px); animation: fadeUp 0.5s ease;
+}}
+.kpi-label {{ font-family: 'JetBrains Mono', monospace; font-size: 0.68rem; color: var(--hva-muted); text-transform: uppercase; letter-spacing: 0.08em; }}
+.kpi-value {{ font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 1.4rem; color: var(--hva-text); margin-top: 2px; }}
+
+/* House illustration wrap */
+.house-illustration {{
+    animation: slideInImg 0.6s ease;
+    text-align: center;
+}}
+.house-illustration img, .house-illustration svg {{ animation: flashPop 0.7s ease; border-radius: 12px; }}
+
+/* Diff callout */
+.diff-callout {{
+    border-left: 3px solid var(--hva-accent2);
+    background: var(--hva-glass);
+    padding: 10px 14px; border-radius: 8px; font-family: 'JetBrains Mono', monospace;
+    font-size: 0.82rem; margin-top: 10px; animation: fadeUp 0.5s ease;
+}}
+
+.trait-pill {{
+    display: inline-block; padding: 4px 10px; margin: 3px 4px 3px 0;
+    border: 1px solid var(--hva-border); border-radius: 999px;
+    font-family: 'JetBrains Mono', monospace; font-size: 0.72rem;
+    background: rgba(142,202,230,0.08); color: var(--hva-text);
+}}
+
+[data-testid="stExpander"] {{ border: 1px solid var(--hva-border) !important; background: var(--hva-glass) !important; border-radius: 12px !important; }}
+[data-testid="stTabs"] button[role="tab"] {{ font-family: 'Space Grotesk', sans-serif; font-weight: 600; }}
+[data-testid="stDataFrame"] {{ border-radius: 10px; overflow: hidden; }}
 </style>
 """
