@@ -7,6 +7,7 @@ an insights tab. Prices are in Indian Rupees.
 
 import os
 import json
+import math
 import datetime
 
 import joblib
@@ -19,10 +20,27 @@ from utils import (
     INK, YELLOW, PINK, TEAL, BLUE, GREEN, RED, CREAM, STATUS_META,
     format_inr, short_inr, indian_grouping, budget_status, price_tier,
     get_quality_traits, explain_price, render_house_svg, puzzle_reveal_html,
-    theme_css, suggest_rooms,
+    theme_css,
 )
 
 st.set_page_config(page_title="HomeValue AI · Prayagraj", page_icon="🏠", layout="wide")
+
+
+# ---------------------------------------------------------------------------
+# ROOMS FROM AREA ("basic idea" of bedrooms / bathrooms for any land size)
+# Same relationship the training data was built on (~1 bedroom per 480 sq ft,
+# bathrooms ~ 0.75 x bedrooms), growing smoothly for very large areas.
+# ---------------------------------------------------------------------------
+def suggest_rooms(area_sqft):
+    area = max(float(area_sqft), 0.0)
+    if area <= 2900:
+        beds = math.ceil(area / 480 - 0.5)
+    else:
+        beds = math.ceil(2900 / 480 - 0.5) + math.ceil((area - 2900) / 1500 - 0.5)
+    beds = max(1, int(beds))
+    baths = max(1, int(math.floor(beds * 0.75 + 0.5)))
+    label = f"{beds} BHK large home / bungalow" if beds >= 7 else f"{beds} BHK"
+    return {"bedrooms": beds, "bathrooms": baths, "label": label}
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(SCRIPT_DIR, "..", "Model", "house_price_model.pkl")
