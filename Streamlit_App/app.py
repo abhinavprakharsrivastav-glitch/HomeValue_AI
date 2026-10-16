@@ -6,7 +6,7 @@ an insights tab. Prices are in Indian Rupees.
 """
 
 import os
-import jso"""
+import json
 app.py — HomeValue AI · Prayagraj
 Neo-brutalist map dashboard for estimating house prices across Prayagraj
 localities, with famous places, budget-aware map colouring, compare mode and
