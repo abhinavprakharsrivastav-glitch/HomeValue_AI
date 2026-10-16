@@ -186,17 +186,25 @@ def build_map(map_df, visible, show_lm, find_place, tilt, focus_loc, focus_text)
                                     hoverinfo="skip", showlegend=False))
 
     if not vis.empty:
-        fig.add_trace(go.Scattermap(lat=vis["lat"], lon=vis["lon"], mode="markers",
-                                    marker=dict(size=21, color=INK), hoverinfo="skip", showlegend=False))
-        fig.add_trace(go.Scattermap(
-            lat=vis["lat"], lon=vis["lon"], mode="markers+text", text=vis["location"],
-            textposition="top center", textfont=dict(size=11, color=INK),
-            marker=dict(size=15, color=[STATUS_META[s]["color"] for s in vis["status"]]),
-            customdata=list(zip(vis["rate_per_sqft"], vis["pred"].map(short_inr),
-                                vis["status"].map(lambda s: STATUS_META[s]["label"]), vis["tier"])),
-            hovertemplate=("<b>%{text}</b> (%{customdata[3]})<br>Base rate: ₹%{customdata[0]:,}/sq ft"
-                           "<br>Estimate for your specs: <b>%{customdata[1]}</b><br>%{customdata[2]}<extra></extra>"),
-            showlegend=False))
+        # dark outline layer under the coloured dots
+        fig.add_trace(go.Scattermap(lat=vis["lat"].astype(float).tolist(), lon=vis["lon"].astype(float).tolist(),
+                                    mode="markers", marker=dict(size=21, color=INK),
+                                    hoverinfo="skip", showlegend=False))
+        # one trace per budget status, each with ONE plain colour (most reliable across plotly.js versions)
+        for status, meta in STATUS_META.items():
+            sub = vis[vis["status"] == status]
+            if sub.empty:
+                continue
+            fig.add_trace(go.Scattermap(
+                lat=sub["lat"].astype(float).tolist(), lon=sub["lon"].astype(float).tolist(),
+                mode="markers+text", text=sub["location"].tolist(),
+                textposition="top center", textfont=dict(size=11, color=INK),
+                marker=dict(size=15, color=meta["color"]),
+                customdata=[[int(r), str(p), str(meta["label"]), str(t)]
+                            for r, p, t in zip(sub["rate_per_sqft"], sub["pred"].map(short_inr), sub["tier"])],
+                hovertemplate=("<b>%{text}</b> (%{customdata[3]})<br>Base rate: ₹%{customdata[0]:,}/sq ft"
+                               "<br>Estimate for your specs: <b>%{customdata[1]}</b><br>%{customdata[2]}<extra></extra>"),
+                showlegend=False))
 
     if show_lm:
         fig.add_trace(go.Scattermap(lat=lm_df["lat"], lon=lm_df["lon"], mode="markers",
@@ -340,6 +348,9 @@ with right:
                                       format_func=place_label)
             visible = t2.multiselect("Show", list(STATUS_META.keys()), default=list(STATUS_META.keys()),
                                      format_func=lambda s: STATUS_META[s]["label"])
+            if not visible:
+                visible = list(STATUS_META.keys())
+                t2.caption("Nothing selected, showing all")
             show_lm = t3.checkbox("Landmarks", value=True)
             t4.write("")
             t4.button("Toggle 3D tilt", key="btn_tilt", on_click=_toggle_tilt, width="stretch")
