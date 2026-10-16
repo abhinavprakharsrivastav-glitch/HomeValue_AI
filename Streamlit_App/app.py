@@ -1,586 +1,756 @@
 """
-app.py — HomeValue AI · Prayagraj
-Neo-brutalist map dashboard for estimating house prices across Prayagraj
-localities, with famous places, budget-aware map colouring, compare mode and
-an insights tab. Prices are in Indian Rupees.
+utils.py — HomeValue AI
+Helper functions: currency formatting, Indian locality mapping,
+rule-based "why this price" explanations, parametric SVG house
+illustration, animated particle/constellation background, and
+theme (dark/light) CSS generation.
 """
 
-import os
-import json
-import datetime
+import random
 
-import joblib
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-import streamlit as st
-
-from utils import (
-    INK, YELLOW, PINK, TEAL, BLUE, GREEN, RED, CREAM, STATUS_META,
-    format_inr, short_inr, indian_grouping, budget_status, price_tier,
-    get_quality_traits, explain_price, render_house_svg, puzzle_reveal_html,
-    theme_css,
-)
-
-st.set_page_config(page_title="HomeValue AI · Prayagraj", page_icon="🏠", layout="wide")
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(SCRIPT_DIR, "..", "Model", "house_price_model.pkl")
-META_PATH = os.path.join(SCRIPT_DIR, "..", "Model", "model_metadata.json")
-DATA_PATH = os.path.join(SCRIPT_DIR, "..", "Dataset", "house_data_cleaned.csv")
-LOC_PATH = os.path.join(SCRIPT_DIR, "..", "Dataset", "locality_info.csv")
-LM_PATH = os.path.join(SCRIPT_DIR, "..", "Dataset", "landmarks.csv")
+# ---------------------------------------------------------------------------
+# CURRENCY
+# ---------------------------------------------------------------------------
+# The bundled dataset is a synthetic training set with prices in USD.
+# We apply a fixed, clearly-labelled conversion rate to present every
+# figure in Indian Rupees. Change USD_TO_INR if you want a different rate.
+USD_TO_INR = 83.0
 
 
-@st.cache_resource
-def load_model():
-    model = joblib.load(MODEL_PATH)
-    with open(META_PATH) as f:
-        meta = json.load(f)
-    return model, meta
+def usd_to_inr(usd_amount: float) -> float:
+    return usd_amount * USD_TO_INR
 
 
-@st.cache_data
-def load_tables():
-    return (pd.read_csv(DATA_PATH), pd.read_csv(LOC_PATH), pd.read_csv(LM_PATH))
+def indian_grouping(n: int) -> str:
+    """Format an integer with Indian digit grouping (e.g. 12,34,567)."""
+    s = str(int(n))
+    if len(s) <= 3:
+        return s
+    head, tail = s[:-3], s[-3:]
+    parts = []
+    while len(head) > 2:
+        parts.insert(0, head[-2:])
+        head = head[:-2]
+    if head:
+        parts.insert(0, head)
+    return ",".join(parts) + "," + tail
 
 
-model, meta = load_model()
-df, loc_df, lm_df = load_tables()
-loc_df = loc_df.reset_index(drop=True)
-best_model_name = meta["best_model"]
-best_r2 = meta["metrics"][best_model_name]["R2"]
-best_mae = meta["metrics"][best_model_name]["MAE"]
+def format_inr(usd_amount: float, short: bool = False) -> str:
+    """Full Indian-formatted rupee string, e.g. ₹2,73,10,483."""
+    inr = usd_to_inr(usd_amount)
+    if short:
+        return short_inr(usd_amount)
+    return f"₹{indian_grouping(round(inr))}"
 
-stats = {
-    "area_median": float(df["area_sqft"].median()),
-    "rate_median": float((df["price"] / df["area_sqft"]).median()),
-    "price_quantiles": {q: float(df["price"].quantile(q)) for q in [0.25, 0.5, 0.75, 0.9]},
+
+def short_inr(usd_amount: float) -> str:
+    """Compact Lakh / Crore style, e.g. ₹1.24 Cr or ₹42.3 L."""
+    inr = usd_to_inr(usd_amount)
+    if inr >= 1_00_00_000:
+        return f"₹{inr / 1_00_00_000:.2f} Cr"
+    if inr >= 1_00_000:
+        return f"₹{inr / 1_00_000:.2f} L"
+    return f"₹{indian_grouping(round(inr))}"
+
+
+# ---------------------------------------------------------------------------
+# LAND PLANNER  (land area -> suggested bedrooms & bathrooms)
+# ---------------------------------------------------------------------------
+# The training data has no link between area and room count (correlation ~0),
+# so this is rule-based, using typical Indian residential norms for
+# built-up area per configuration. Output is clamped to the model's trained
+# range (1-6 bedrooms, 1-4 bathrooms) so it can feed the price estimator.
+LAND_UNITS = {
+    "sq ft": 1.0,
+    "sq yards (gaj)": 9.0,
+    "sq metres": 10.7639,
 }
-LOC_NAMES = sorted(loc_df["location"].tolist())
-OVERVIEW = "overview"
 
-# ---------------------------------------------------------------------------
-# SESSION STATE + CALLBACKS
-# ---------------------------------------------------------------------------
-for k, v in {"tilt": False, "reveal_counter": 0, "reveal_counter_cmp": 0,
-             "has_predicted": False, "has_compared": False, "find_place": OVERVIEW}.items():
-    st.session_state.setdefault(k, v)
-
-
-def _reveal():
-    st.session_state["has_predicted"] = True
-    st.session_state["reveal_counter"] += 1
+# (min built-up sq ft, bedrooms, bathrooms, label)
+_ROOM_TIERS = [
+    (0,    1, 1, "1 BHK (compact)"),
+    (450,  1, 1, "1 BHK"),
+    (700,  2, 2, "2 BHK"),
+    (1150, 3, 2, "3 BHK (standard)"),
+    (1500, 3, 3, "3 BHK (spacious)"),
+    (2000, 4, 4, "4 BHK"),
+    (3200, 5, 4, "5 BHK"),
+    (4500, 6, 4, "6 BHK"),
+]
 
 
-def _toggle_tilt():
-    st.session_state["tilt"] = not st.session_state["tilt"]
+def to_sqft(value: float, unit: str) -> float:
+    return value * LAND_UNITS.get(unit, 1.0)
 
 
-def _reset_view():
-    st.session_state["find_place"] = OVERVIEW
-    st.session_state["tilt"] = False
+def _tier_index(built_up_sqft: float) -> int:
+    idx = 0
+    for i, (lo, *_rest) in enumerate(_ROOM_TIERS):
+        if built_up_sqft >= lo:
+            idx = i
+    return idx
 
 
-st.markdown(theme_css(), unsafe_allow_html=True)
+def suggest_rooms(land_sqft: float, coverage_pct: float = 60, floors: int = 1) -> dict:
+    """Suggest bedrooms/bathrooms from land area.
 
+    built_up = land * ground coverage * floors
+    Returns the recommended layout plus the next-smaller / next-larger
+    layouts as alternatives (e.g. for a more compact or more spacious plan).
+    """
+    built_up = max(land_sqft, 0) * (coverage_pct / 100.0) * floors
+    i = _tier_index(built_up)
+    lo, beds, baths, label = _ROOM_TIERS[i]
 
-# ---------------------------------------------------------------------------
-# MODEL HELPERS
-# ---------------------------------------------------------------------------
-def build_input_df(area_sqft, bedrooms, bathrooms, age_years, distance_to_city_km,
-                   garage, garden, lift, near_school, location):
-    row = {
-        "area_sqft": area_sqft, "bedrooms": bedrooms, "bathrooms": bathrooms,
-        "age_years": age_years, "distance_to_city_km": distance_to_city_km,
-        "total_rooms": bedrooms + bathrooms,
-        "amenity_score": int(garage) + int(garden) + int(lift) + int(near_school),
-        "is_new": int(age_years <= 5),
-        "garage": int(garage), "garden": int(garden), "lift": int(lift),
-        "near_school": int(near_school), "location": location,
+    def pack(j):
+        _lo, b, ba, lab = _ROOM_TIERS[j]
+        return {"bedrooms": b, "bathrooms": ba, "label": lab, "min_sqft": _lo}
+
+    alt_compact = pack(i - 1) if i > 0 else None
+    alt_spacious = pack(i + 1) if i < len(_ROOM_TIERS) - 1 else None
+
+    return {
+        "land_sqft": land_sqft,
+        "built_up_sqft": built_up,
+        "bedrooms": beds,
+        "bathrooms": baths,
+        "label": label,
+        "sqft_per_bedroom": built_up / beds if beds else 0,
+        "too_small": built_up < 300,
+        "alt_compact": alt_compact,
+        "alt_spacious": alt_spacious,
     }
-    return pd.DataFrame([row]), row
-
-
-def loc_row(name):
-    return loc_df[loc_df["location"] == name].iloc[0]
-
-
-@st.cache_data
-def predict_all(area, bed, bath, age, garage, garden, lift, school):
-    rows = [build_input_df(area, bed, bath, age, r.distance_to_city_km,
-                           garage, garden, lift, school, r.location)[1]
-            for r in loc_df.itertuples()]
-    return model.predict(pd.DataFrame(rows))
-
-
-def predict_one(specs):
-    """specs = (area, bed, bath, age, locality, garage, garden, lift, school)"""
-    area, bed, bath, age, loc, garage, garden, lift, school = specs
-    d = float(loc_row(loc)["distance_to_city_km"])
-    X, row = build_input_df(area, bed, bath, age, d, garage, garden, lift, school, loc)
-    return float(model.predict(X)[0]), row
 
 
 # ---------------------------------------------------------------------------
-# MAP
+# INDIAN-STYLE LOCALITY NAMES
 # ---------------------------------------------------------------------------
-def map_view(find_place):
-    if find_place == OVERVIEW:
-        return 25.452, 81.853, 11.1
-    kind, name = find_place.split("::")
-    if kind == "loc":
-        r = loc_row(name)
-        return float(r["lat"]), float(r["lon"]), 13.3
-    r = lm_df[lm_df["name"] == name].iloc[0]
-    return float(r["lat"]), float(r["lon"]), 14.2
+# The model was trained on these exact category strings, so we never change
+# the underlying values sent to the model — only how they are displayed.
+LOCATION_DISPLAY = {
+    "City Center": "City Center (CBD)",
+    "Downtown": "Downtown (Old City / Commercial Hub)",
+    "Uptown": "Uptown (Posh Colony)",
+    "Suburb": "Suburb (Residential Township)",
+    "Rural": "Rural / Outskirts",
+}
+LOCATION_ICON = {
+    "City Center": "🏙️",
+    "Downtown": "🏬",
+    "Uptown": "🏡",
+    "Suburb": "🏘️",
+    "Rural": "🌾",
+}
 
 
-def build_map(map_df, visible, show_lm, find_place, tilt, focus_loc, focus_text):
-    fig = go.Figure()
-    vis = map_df[map_df["status"].isin(visible)]
+def display_locations(locations):
+    return [LOCATION_DISPLAY.get(loc, loc) for loc in locations]
 
-    if focus_loc is not None:
-        r = loc_row(focus_loc)
-        fig.add_trace(go.Scattermap(lat=[r["lat"]], lon=[r["lon"]], mode="markers",
-                                    marker=dict(size=42, color=PINK, opacity=0.75),
-                                    hoverinfo="skip", showlegend=False))
 
-    if not vis.empty:
-        fig.add_trace(go.Scattermap(lat=vis["lat"], lon=vis["lon"], mode="markers",
-                                    marker=dict(size=21, color=INK), hoverinfo="skip", showlegend=False))
-        fig.add_trace(go.Scattermap(
-            lat=vis["lat"], lon=vis["lon"], mode="markers+text", text=vis["location"],
-            textposition="top center", textfont=dict(size=11, color=INK),
-            marker=dict(size=15, color=[STATUS_META[s]["color"] for s in vis["status"]]),
-            customdata=list(zip(vis["rate_per_sqft"], vis["pred"].map(short_inr),
-                                vis["status"].map(lambda s: STATUS_META[s]["label"]), vis["tier"])),
-            hovertemplate=("<b>%{text}</b> (%{customdata[3]})<br>Base rate: ₹%{customdata[0]:,}/sq ft"
-                           "<br>Estimate for your specs: <b>%{customdata[1]}</b><br>%{customdata[2]}<extra></extra>"),
-            showlegend=False))
+def to_raw_location(display_value: str, locations):
+    for loc in locations:
+        if LOCATION_DISPLAY.get(loc, loc) == display_value:
+            return loc
+    return display_value
 
-    if show_lm:
-        fig.add_trace(go.Scattermap(lat=lm_df["lat"], lon=lm_df["lon"], mode="markers",
-                                    marker=dict(size=19, color=INK), hoverinfo="skip", showlegend=False))
-        fig.add_trace(go.Scattermap(
-            lat=lm_df["lat"], lon=lm_df["lon"], mode="markers+text", text=lm_df["name"],
-            textposition="bottom center", textfont=dict(size=11, color="#1B3A8A"),
-            marker=dict(size=13, color=BLUE),
-            customdata=list(zip(lm_df["note"], lm_df["nearest_locality"])),
-            hovertemplate="<b>%{text}</b><br>%{customdata[0]}<br>Nearest locality: %{customdata[1]}<extra></extra>",
-            showlegend=False))
 
-    if focus_loc is not None and focus_text:
-        r = loc_row(focus_loc)
-        fig.add_trace(go.Scattermap(lat=[r["lat"]], lon=[r["lon"]], mode="text", text=[focus_text],
-                                    textposition="bottom center", textfont=dict(size=14, color=INK),
-                                    hoverinfo="skip", showlegend=False))
+# ---------------------------------------------------------------------------
+# LOCALITY "QUALITY" TRAITS
+# ---------------------------------------------------------------------------
+LOCATION_TRAITS = {
+    "City Center": [
+        "Near markets & shopping hubs",
+        "Excellent metro / bus connectivity",
+        "Close to hospitals & offices",
+    ],
+    "Downtown": [
+        "Heart of commercial activity",
+        "Walking distance to markets & shops",
+        "High rental demand in this pocket",
+    ],
+    "Uptown": [
+        "Premium, low-density neighbourhood",
+        "Gated-community feel, upscale surroundings",
+        "Sought after by premium buyers",
+    ],
+    "Suburb": [
+        "Family-friendly residential township",
+        "More open space & easier parking",
+        "Quieter than the city core",
+    ],
+    "Rural": [
+        "Peaceful, low-noise surroundings",
+        "Larger plot potential",
+        "Ideal for a farmhouse-style home",
+    ],
+}
 
-    lat, lon, zoom = map_view(find_place)
-    fig.update_layout(
-        map=dict(style="open-street-map", center=dict(lat=lat, lon=lon), zoom=zoom,
-                 pitch=55 if tilt else 0, bearing=-15 if tilt else 0),
-        height=660, margin=dict(l=0, r=0, t=0, b=0), showlegend=False,
-        paper_bgcolor="rgba(0,0,0,0)",
-        hoverlabel=dict(bgcolor=CREAM, bordercolor=INK, font=dict(color=INK, size=13)),
+
+def get_quality_traits(location, garage, garden, pool, near_school, age_years, distance_km):
+    traits = list(LOCATION_TRAITS.get(location, []))
+    if garage:
+        traits.append("Dedicated covered parking")
+    if garden:
+        traits.append("Private garden / lawn space")
+    if pool:
+        traits.append("Swimming pool — a premium feature")
+    if near_school:
+        traits.append("Walking distance to a school")
+    if age_years <= 5:
+        traits.append("Newly built — low maintenance expected")
+    elif age_years >= 35:
+        traits.append("Older property — may need some renovation")
+    if distance_km <= 3:
+        traits.append("Very close to the city — high convenience")
+    elif distance_km >= 20:
+        traits.append("Far from the city — more affordable, more peaceful")
+    return traits[:6]
+
+
+# ---------------------------------------------------------------------------
+# RULE-BASED "WHY THIS PRICE" EXPLANATION
+# ---------------------------------------------------------------------------
+def explain_price(inputs: dict, stats: dict):
+    """
+    Produce short bullet points explaining why the estimate is relatively
+    high or low, by comparing the given inputs against dataset statistics.
+    This is a transparent, rule-based explainer (not a formal SHAP
+    decomposition) meant to give an intuitive sense of the main drivers.
+    """
+    bullets = []
+
+    area = inputs["area_sqft"]
+    area_med = stats["area_median"]
+    if area >= area_med * 1.2:
+        bullets.append(f"↑ Larger than a typical home ({area:,.0f} sq ft vs ~{area_med:,.0f} sq ft median) — pushes the price up")
+    elif area <= area_med * 0.8:
+        bullets.append(f"↓ Smaller than a typical home ({area:,.0f} sq ft vs ~{area_med:,.0f} sq ft median) — brings the price down")
+
+    dist = inputs["distance_to_city_km"]
+    if dist <= 3:
+        bullets.append("↑ Very close to the city centre — proximity adds a premium")
+    elif dist >= 18:
+        bullets.append("↓ Located far from the city centre — distance lowers the price")
+
+    age = inputs["age_years"]
+    if age <= 5:
+        bullets.append("↑ Newly built property — recency adds a premium")
+    elif age >= 40:
+        bullets.append("↓ Older property — age brings the price down")
+
+    loc = inputs["location"]
+    premium_locations = {"City Center", "Uptown", "Downtown"}
+    if loc in premium_locations:
+        bullets.append(f"↑ {LOCATION_DISPLAY.get(loc, loc)} is a premium locality — location adds significant value")
+    else:
+        bullets.append(f"↓ {LOCATION_DISPLAY.get(loc, loc)} is a more affordable locality — keeps the price moderate")
+
+    amenity_score = int(inputs["garage"]) + int(inputs["garden"]) + int(inputs["pool"]) + int(inputs["near_school"])
+    if inputs["pool"]:
+        bullets.append("↑ Private pool is a high-value amenity")
+    if amenity_score >= 3:
+        bullets.append(f"↑ {amenity_score}/4 amenities present — extra features add to the estimate")
+    elif amenity_score <= 1:
+        bullets.append(f"↓ Only {amenity_score}/4 amenities present — fewer features keep the estimate lower")
+
+    rooms = inputs["bedrooms"] + inputs["bathrooms"]
+    if rooms >= 8:
+        bullets.append(f"↑ {inputs['bedrooms']} bedrooms + {inputs['bathrooms']} bathrooms is spacious — more rooms add value")
+    elif rooms <= 3:
+        bullets.append(f"↓ Compact layout ({inputs['bedrooms']} bed / {inputs['bathrooms']} bath) — fewer rooms keep the price lower")
+
+    if not bullets:
+        bullets.append("This home sits close to the dataset average on most factors — a fairly typical estimate")
+
+    return bullets[:6]
+
+
+# ---------------------------------------------------------------------------
+# PRICE TIER (for the house illustration + labelling)
+# ---------------------------------------------------------------------------
+def price_tier(prediction, stats):
+    q = stats["price_quantiles"]
+    if prediction < q[0.25]:
+        return "Budget Home", 1
+    if prediction < q[0.50]:
+        return "Mid-Range Home", 2
+    if prediction < q[0.75]:
+        return "Comfort Home", 3
+    if prediction < q[0.90]:
+        return "Premium Home", 4
+    return "Luxury Villa", 5
+
+
+# ---------------------------------------------------------------------------
+# PARAMETRIC HOUSE SVG (no external images / internet needed)
+# ---------------------------------------------------------------------------
+def render_house_svg(tier_level, garage, garden, pool, uptown_gate, dark_mode=True):
+    """Build a small parametric SVG house that scales in complexity with
+    the price tier (1=budget .. 5=luxury) and reflects chosen amenities."""
+
+    sky_top = "#0A1F38" if dark_mode else "#BFE3F5"
+    sky_bot = "#16283A" if dark_mode else "#EAF6FF"
+    ground = "#1B3A2E" if dark_mode else "#BEE3C6"
+    wall_colors = ["#8E7A63", "#A9906F", "#C7A76C", "#D9B672", "#E7C873"]
+    roof_colors = ["#5A3A2A", "#6E4530", "#7C4A2A", "#8B3E2A", "#A13B2A"]
+    wall = wall_colors[tier_level - 1]
+    roof = roof_colors[tier_level - 1]
+    gold = "#E3B23C"
+    two_story = tier_level >= 4
+    win_rows = 2 if two_story else 1
+    win_cols = 3 if tier_level >= 3 else 2
+
+    W, H = 340, 220
+    house_w = 150 + tier_level * 12
+    house_h = 90 if not two_story else 130
+    house_x = (W - house_w) / 2
+    house_y = 150 - house_h
+
+    windows = ""
+    win_w, win_h = 20, 20
+    for r in range(win_rows):
+        for c in range(win_cols):
+            wx = house_x + 14 + c * ((house_w - 28) / max(win_cols - 1, 1)) - win_w / 2
+            wx = house_x + 14 + c * ((house_w - 28 - win_w) / max(win_cols - 1, 1))
+            wy = house_y + 14 + r * (house_h / max(win_rows, 1))
+            windows += (
+                f'<rect x="{wx:.1f}" y="{wy:.1f}" width="{win_w}" height="{win_h}" '
+                f'rx="2" fill="{gold}" opacity="0.85" stroke="#3a2a1a" stroke-width="1.5"/>'
+                f'<line x1="{wx + win_w/2:.1f}" y1="{wy:.1f}" x2="{wx + win_w/2:.1f}" y2="{wy+win_h:.1f}" stroke="#3a2a1a" stroke-width="1"/>'
+            )
+
+    door_w, door_h = 26, 40
+    door_x = house_x + house_w / 2 - door_w / 2
+    door_y = house_y + house_h - door_h
+    door = (
+        f'<rect x="{door_x:.1f}" y="{door_y:.1f}" width="{door_w}" height="{door_h}" '
+        f'rx="3" fill="#4A2E1E" stroke="#2B1B10" stroke-width="1.5"/>'
+        f'<circle cx="{door_x + door_w - 5:.1f}" cy="{door_y + door_h/2:.1f}" r="1.6" fill="{gold}"/>'
     )
-    return fig
+
+    roof_pts = f"{house_x-10},{house_y} {house_x+house_w/2},{house_y-45} {house_x+house_w+10},{house_y}"
+    roof_svg = f'<polygon points="{roof_pts}" fill="{roof}" stroke="#2B1B10" stroke-width="2"/>'
+
+    garage_svg = ""
+    if garage:
+        gw, gh = 55, 55
+        gx, gy = house_x - gw + 6, 150 - gh
+        garage_svg = (
+            f'<rect x="{gx:.1f}" y="{gy:.1f}" width="{gw}" height="{gh}" fill="{wall}" stroke="#2B1B10" stroke-width="2"/>'
+            f'<rect x="{gx+6:.1f}" y="{gy+gh-30:.1f}" width="{gw-12}" height="26" rx="2" fill="#5b5049" stroke="#2B1B10" stroke-width="1.5"/>'
+            f'<polygon points="{gx-4},{gy} {gx+gw/2:.1f},{gy-20} {gx+gw+4},{gy}" fill="{roof}" stroke="#2B1B10" stroke-width="1.5"/>'
+        )
+
+    pool_svg = ""
+    if pool:
+        pool_svg = (
+            f'<ellipse cx="{house_x + house_w + 45:.1f}" cy="188" rx="34" ry="14" '
+            f'fill="#3AA6C9" opacity="0.85" stroke="#1c6b85" stroke-width="2"/>'
+            f'<ellipse cx="{house_x + house_w + 45:.1f}" cy="188" rx="24" ry="8" fill="#8EE3F5" opacity="0.6"/>'
+        )
+
+    garden_svg = ""
+    if garden:
+        tree_x = [house_x - 34, house_x + house_w + 20]
+        for tx in tree_x:
+            garden_svg += (
+                f'<rect x="{tx-3:.1f}" y="165" width="6" height="20" fill="#4A2E1E"/>'
+                f'<circle cx="{tx:.1f}" cy="158" r="16" fill="#3E8E5B"/>'
+                f'<circle cx="{tx-9:.1f}" cy="164" r="11" fill="#4CA968"/>'
+                f'<circle cx="{tx+9:.1f}" cy="164" r="11" fill="#4CA968"/>'
+            )
+
+    gate_svg = ""
+    if uptown_gate or tier_level >= 4:
+        gate_svg = (
+            f'<rect x="20" y="195" width="{W-40}" height="6" fill="#7a6a52"/>'
+            f'<rect x="20" y="180" width="5" height="21" fill="#7a6a52"/>'
+            f'<rect x="{W-25}" y="180" width="5" height="21" fill="#7a6a52"/>'
+        )
+
+    chimney = ""
+    if tier_level >= 2:
+        chimney = f'<rect x="{house_x+house_w-30:.1f}" y="{house_y-30:.1f}" width="12" height="30" fill="#5a4a3a" stroke="#2B1B10" stroke-width="1.5"/>'
+
+    stars = ""
+    if dark_mode:
+        rnd = random.Random(tier_level * 17)
+        for _ in range(18):
+            sx, sy = rnd.uniform(5, W - 5), rnd.uniform(5, 110)
+            stars += f'<circle cx="{sx:.1f}" cy="{sy:.1f}" r="{rnd.uniform(0.6,1.6):.1f}" fill="#C7ECFB" opacity="{rnd.uniform(0.4,0.9):.2f}"/>'
+
+    sun_moon = (
+        f'<circle cx="285" cy="35" r="16" fill="{"#EAF3FF" if dark_mode else "#FFD34D"}" opacity="0.9"/>'
+    )
+
+    svg = f"""
+<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;max-width:360px;">
+  <defs>
+    <linearGradient id="sky{tier_level}" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="{sky_top}"/>
+      <stop offset="100%" stop-color="{sky_bot}"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="{W}" height="{H}" fill="url(#sky{tier_level})"/>
+  {stars}
+  {sun_moon}
+  <rect x="0" y="150" width="{W}" height="{H-150}" fill="{ground}"/>
+  {gate_svg}
+  {garden_svg}
+  {garage_svg}
+  {roof_svg}
+  <rect x="{house_x:.1f}" y="{house_y:.1f}" width="{house_w}" height="{house_h}" fill="{wall}" stroke="#2B1B10" stroke-width="2.5"/>
+  {chimney}
+  {windows}
+  {door}
+  {pool_svg}
+</svg>
+"""
+    return svg
 
 
 # ---------------------------------------------------------------------------
-# HEADER
+# PUZZLE-STYLE PRICE REVEAL (CSS tiles that fly apart to reveal the number)
 # ---------------------------------------------------------------------------
-st.markdown(f"""
-<div class="nn-header">
-  <div>
-    <p class="nn-title">🏠 HomeValue AI · Prayagraj</p>
-    <p class="nn-sub">House price estimator for Prayagraj only · {best_model_name} · avg. error ≈ {short_inr(best_mae)} · R² {best_r2:.2f}</p>
-  </div>
-  <span class="nn-badge">{len(loc_df)} LOCALITIES · {len(lm_df)} FAMOUS PLACES</span>
+def puzzle_reveal_html(value_text: str, caption_text: str, key: str, accent="#E3B23C"):
+    import math
+    tiles = ""
+    n_cols, n_rows = 6, 3
+    i = 0
+    for r in range(n_rows):
+        for c in range(n_cols):
+            rnd = random.Random(hash(key) + i)
+            delay = (i * 0.045) + rnd.uniform(0, 0.05)
+            angle_deg = random.Random(hash(key) + i + 100).uniform(-140, 140)
+            dist = 140
+            dx = math.cos(math.radians(angle_deg)) * dist
+            dy = math.sin(math.radians(angle_deg)) * dist
+            tiles += (
+                f'<div class="puzzle-tile pt-{key}" style="'
+                f'left:{c/n_cols*100:.3f}%; top:{r/n_rows*100:.3f}%; '
+                f'width:{100/n_cols:.3f}%; height:{100/n_rows:.3f}%; '
+                f'animation-delay:{delay:.3f}s; --fly-x:{dx:.1f}px; --fly-y:{dy:.1f}px; '
+                f'--fly-rot:{angle_deg:.1f}deg;"></div>'
+            )
+            i += 1
+
+    html = f"""
+<div class="puzzle-wrap" id="puzzle-{key}">
+  <div class="puzzle-value">{value_text}</div>
+  <div class="puzzle-caption">{caption_text}</div>
+  <div class="puzzle-tiles">{tiles}</div>
 </div>
-""", unsafe_allow_html=True)
+<style>
+.puzzle-wrap {{
+    position: relative;
+    text-align: center;
+    padding: 18px 10px;
+    overflow: hidden;
+    border-radius: 10px;
+}}
+.puzzle-value {{
+    font-family: 'Space Grotesk', sans-serif;
+    font-weight: 700;
+    font-size: 2.6rem;
+    color: {accent};
+    letter-spacing: 0.01em;
+    position: relative;
+    z-index: 1;
+}}
+.puzzle-caption {{
+    position: relative;
+    z-index: 1;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75rem;
+    opacity: 0.75;
+    margin-top: 4px;
+}}
+.puzzle-tiles {{
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    pointer-events: none;
+}}
+.pt-{key} {{
+    position: absolute;
+    background: linear-gradient(135deg, #1c3352, #0e1f38);
+    border: 1px solid rgba(142,202,230,0.25);
+    animation: puzzleFly-{key} 0.7s cubic-bezier(.4,0,.2,1) forwards;
+}}
+@keyframes puzzleFly-{key} {{
+    0%   {{ opacity: 1; transform: translate(0,0) rotate(0deg) scale(1); }}
+    100% {{ opacity: 0; transform: translate(var(--fly-x), var(--fly-y)) rotate(var(--fly-rot)) scale(0.3); }}
+}}
+</style>
+"""
+    return html
 
-tab_map, tab_compare, tab_insights = st.tabs(["🗺️ Map & Estimate", "⚖️ Compare", "📊 Insights"])
 
-# ===========================================================================
-# TAB 1 — MAP & ESTIMATE
-# ===========================================================================
-with tab_map:
-    col_l, col_r = st.columns([1, 2.7], gap="large")
+# ---------------------------------------------------------------------------
+# PARTICLE / STARFIELD BACKGROUND (pure CSS, no JS/iframe needed)
+# ---------------------------------------------------------------------------
+def particle_background_css(dark_mode=True):
+    """Build a drifting, twinkling starfield using only CSS box-shadows.
+    Rendered directly via st.markdown (unsafe_allow_html=True) so it lives
+    in the real page DOM - no iframe, no JS, nothing that can be sandboxed
+    or blocked. Three depth layers give a subtle parallax feel."""
+    dot_color = "142,202,230" if dark_mode else "70,120,160"
 
-    with col_l:
-        with st.container(key="filters_panel"):
-            st.markdown('<div class="panel-title">▼ Filters</div>', unsafe_allow_html=True)
+    def make_layer(n, seed, size, min_op, max_op):
+        rnd = random.Random(seed)
+        shadows = []
+        for _ in range(n):
+            x = rnd.randint(0, 2000)
+            y = rnd.randint(0, 2000)
+            op = round(rnd.uniform(min_op, max_op), 2)
+            shadows.append(f"{x}px {y}px rgba({dot_color},{op})")
+        return ", ".join(shadows)
 
-            place_opts = ([OVERVIEW] + [f"loc::{n}" for n in LOC_NAMES]
-                          + [f"lm::{n}" for n in lm_df["name"]])
+    layer1 = make_layer(90, 11, 1, 0.25, 0.55)   # far, faint, small
+    layer2 = make_layer(55, 22, 2, 0.35, 0.7)    # mid
+    layer3 = make_layer(28, 33, 3, 0.5, 0.9)     # near, brighter
 
-            def fmt_place(v):
-                if v == OVERVIEW:
-                    return "Prayagraj overview"
-                kind, name = v.split("::")
-                return f"{name} ({'locality' if kind == 'loc' else 'famous place'})"
+    html = f"""
+<div class="hva-starfield" aria-hidden="true">
+  <div class="hva-star-layer hva-star-l1"></div>
+  <div class="hva-star-layer hva-star-l2"></div>
+  <div class="hva-star-layer hva-star-l3"></div>
+</div>
+<style>
+.hva-starfield {{
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    overflow: hidden;
+    pointer-events: none;
+}}
+.hva-star-layer {{
+    position: absolute;
+    top: 0; left: 0;
+    width: 2000px; height: 2000px;
+    border-radius: 50%;
+}}
+.hva-star-l1 {{
+    box-shadow: {layer1};
+    width: 1px; height: 1px;
+    animation: hvaDrift1 90s linear infinite;
+}}
+.hva-star-l2 {{
+    box-shadow: {layer2};
+    width: 2px; height: 2px;
+    animation: hvaDrift2 65s linear infinite;
+}}
+.hva-star-l3 {{
+    box-shadow: {layer3};
+    width: 3px; height: 3px;
+    animation: hvaDrift3 40s linear infinite, hvaTwinkle 3.5s ease-in-out infinite alternate;
+}}
+@keyframes hvaDrift1 {{
+    from {{ transform: translate(0, 0); }}
+    to   {{ transform: translate(-400px, 300px); }}
+}}
+@keyframes hvaDrift2 {{
+    from {{ transform: translate(0, 0); }}
+    to   {{ transform: translate(300px, -350px); }}
+}}
+@keyframes hvaDrift3 {{
+    from {{ transform: translate(0, 0); }}
+    to   {{ transform: translate(-250px, -300px); }}
+}}
+@keyframes hvaTwinkle {{
+    from {{ opacity: 0.6; }}
+    to   {{ opacity: 1; }}
+}}
+</style>
+"""
+    return html
 
-            st.selectbox("Find a place", place_opts, format_func=fmt_place, key="find_place")
 
-            st.markdown('<div class="panel-sub">Your budget</div>', unsafe_allow_html=True)
-            budget_lakh = st.slider("Budget (₹ lakh)", 10, 500, 75, step=5, key="budget")
+# ---------------------------------------------------------------------------
+# THEME CSS (dark / light glassmorphism)
+# ---------------------------------------------------------------------------
+def theme_css(dark_mode=True):
+    if dark_mode:
+        bg = "#0A1220"
+        text = "#E8F0F7"
+        muted = "#9FB3C8"
+        glass_bg = "rgba(20, 32, 54, 0.55)"
+        glass_border = "rgba(142, 202, 230, 0.22)"
+        accent = "#8ECAE6"
+        accent2 = "#E3B23C"
+        input_bg = "rgba(255,255,255,0.06)"
+        shadow = "0 8px 32px rgba(0,0,0,0.45)"
+    else:
+        bg = "#F3F6FA"
+        text = "#16283A"
+        muted = "#5A6B7D"
+        glass_bg = "rgba(255, 255, 255, 0.55)"
+        glass_border = "rgba(22, 40, 58, 0.12)"
+        accent = "#1D6FA5"
+        accent2 = "#B9791E"
+        input_bg = "rgba(255,255,255,0.85)"
+        shadow = "0 8px 28px rgba(30,60,90,0.12)"
 
-            st.markdown('<div class="panel-sub">Property</div>', unsafe_allow_html=True)
-            area = st.number_input("Area (sq ft)", min_value=400, max_value=6000, value=1200, step=50, key="e_area")
-            c1, c2 = st.columns(2)
-            with c1:
-                bedrooms = st.selectbox("Bedrooms", [1, 2, 3, 4, 5, 6], index=1, key="e_bed")
-            with c2:
-                bathrooms = st.selectbox("Bathrooms", [1, 2, 3, 4], index=1, key="e_bath")
-            age = st.slider("Age of building (years)", 0, 60, 8, key="e_age")
-            location = st.selectbox("Locality for estimate", LOC_NAMES,
-                                    index=LOC_NAMES.index("Civil Lines"), key="e_loc")
+    return f"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap');
 
-            st.markdown('<div class="panel-sub">Amenities</div>', unsafe_allow_html=True)
-            a1, a2 = st.columns(2)
-            with a1:
-                garage = st.checkbox("Parking", value=True, key="e_garage")
-                lift = st.checkbox("Lift", value=False, key="e_lift")
-            with a2:
-                garden = st.checkbox("Garden", value=False, key="e_garden")
-                near_school = st.checkbox("Near school", value=True, key="e_school")
+:root {{
+    --hva-bg: {bg};
+    --hva-text: {text};
+    --hva-muted: {muted};
+    --hva-glass: {glass_bg};
+    --hva-border: {glass_border};
+    --hva-accent: {accent};
+    --hva-accent2: {accent2};
+    --hva-input: {input_bg};
+    --hva-shadow: {shadow};
+}}
 
-            st.markdown('<div class="panel-sub">Map layers</div>', unsafe_allow_html=True)
-            show_within = st.checkbox("Within budget", value=True, key="f_within")
-            show_stretch = st.checkbox("Stretch (up to +25%)", value=True, key="f_stretch")
-            show_over = st.checkbox("Over budget", value=True, key="f_over")
-            show_lm = st.checkbox("Famous places", value=True, key="f_lm")
+html, body {{
+    background-color: {bg} !important;
+}}
+[data-testid="stAppViewContainer"], [data-testid="stApp"] {{
+    background-color: transparent !important;
+    position: relative;
+    z-index: 1;
+}}
+[data-testid="stHeader"] {{ background: transparent !important; }}
+[data-testid="stSidebar"] {{ display: none; }}
+html, body, [class*="css"] {{ font-family: 'Inter', sans-serif; color: {text}; }}
 
-            st.write("")
-            st.button("Reveal my estimate", width="stretch", key="btn_reveal", on_click=_reveal)
-            st.button("2.5D view", width="stretch", key="btn_tilt", on_click=_toggle_tilt)
-            st.button("Reset view", width="stretch", key="btn_reset", on_click=_reset_view)
+@keyframes fadeUp {{ from {{ opacity: 0; transform: translateY(14px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+@keyframes glowPulse {{
+    0%, 100% {{ box-shadow: 0 0 12px rgba(142,202,230,0.25); }}
+    50% {{ box-shadow: 0 0 26px rgba(142,202,230,0.45); }}
+}}
+@keyframes goldPulse {{
+    0%, 100% {{ box-shadow: 0 0 16px rgba(227,178,60,0.45), 0 0 2px rgba(227,178,60,0.6); }}
+    50% {{ box-shadow: 0 0 30px rgba(227,178,60,0.75), 0 0 6px rgba(227,178,60,0.8); }}
+}}
+@keyframes slideInImg {{
+    from {{ opacity: 0; transform: translateX(30px) scale(0.94); }}
+    to   {{ opacity: 1; transform: translateX(0) scale(1); }}
+}}
+@keyframes flashPop {{
+    0%   {{ filter: brightness(2.4); opacity: 0; transform: scale(0.9); }}
+    40%  {{ filter: brightness(1.5); opacity: 1; }}
+    100% {{ filter: brightness(1); opacity: 1; transform: scale(1); }}
+}}
 
-    # --- compute everything the map needs --------------------------------
-    budget = budget_lakh * 1e5
-    preds = predict_all(area, bedrooms, bathrooms, age, garage, garden, lift, near_school)
-    map_df = loc_df.copy()
-    map_df["pred"] = preds
-    map_df["status"] = [budget_status(p, budget) for p in preds]
-    counts = map_df["status"].value_counts().to_dict()
-    n_w, n_s, n_o = counts.get("within", 0), counts.get("stretch", 0), counts.get("over", 0)
-    total = len(map_df)
+/* Glass header */
+.hva-header {{
+    border: 1px solid var(--hva-border);
+    border-radius: 16px;
+    padding: 20px 28px;
+    margin-bottom: 24px;
+    display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;
+    background: var(--hva-glass);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    box-shadow: var(--hva-shadow);
+    animation: fadeUp 0.5s ease;
+}}
+.hva-title {{
+    font-family: 'Space Grotesk', sans-serif;
+    font-weight: 700; font-size: 2rem; margin: 0;
+    background: linear-gradient(90deg, var(--hva-accent), var(--hva-accent2));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+}}
+.hva-subtitle {{
+    font-family: 'JetBrains Mono', monospace; font-size: 0.78rem;
+    color: var(--hva-muted); letter-spacing: 0.06em; margin-top: 4px;
+}}
 
-    est, est_row = predict_one((area, bedrooms, bathrooms, age, location, garage, garden, lift, near_school))
-    visible = [s for s, on in (("within", show_within), ("stretch", show_stretch), ("over", show_over)) if on]
-    focus_text = f"YOU: {short_inr(est)}" if st.session_state["has_predicted"] else None
-    focus_loc = location if st.session_state["has_predicted"] else None
+/* Glass cards / containers */
+[data-testid="stVerticalBlockBorderWrapper"] {{
+    background: var(--hva-glass) !important;
+    border: 1px solid var(--hva-border) !important;
+    border-radius: 16px !important;
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    padding: 8px;
+    transition: box-shadow 0.25s ease, transform 0.25s ease;
+    animation: fadeUp 0.6s ease;
+}}
+[data-testid="stVerticalBlockBorderWrapper"]:hover {{
+    box-shadow: var(--hva-shadow), 0 0 18px rgba(142,202,230,0.18);
+    transform: translateY(-2px);
+}}
+[data-testid="stVerticalBlockBorderWrapper"] * {{ color: var(--hva-text); }}
 
-    with col_r:
-        with st.container(key="map_wrap"):
-            fig = build_map(map_df, visible, show_lm, st.session_state["find_place"],
-                            st.session_state["tilt"], focus_loc, focus_text)
-            st.plotly_chart(fig, config={"displayModeBar": False, "scrollZoom": True}, key="main_map")
+.hva-winner {{
+    border: 2px solid var(--hva-accent2) !important;
+    animation: goldPulse 2.2s ease-in-out infinite !important;
+}}
 
-            with st.container(key="legend_card"):
-                st.markdown(f"""
-                <div class="lg-title">LEGEND</div>
-                <div class="lg-row"><span class="lg-dot" style="background:{RED}"></span>Over budget</div>
-                <div class="lg-row"><span class="lg-dot" style="background:{YELLOW}"></span>Stretch (up to +25%)</div>
-                <div class="lg-row"><span class="lg-dot" style="background:{GREEN}"></span>Within budget</div>
-                <div class="lg-row"><span class="lg-sq"></span>Famous place</div>
-                <div class="lg-row"><span class="lg-dot" style="background:#fff"></span>Your estimate (pink ring)</div>
-                """, unsafe_allow_html=True)
+.eyebrow {{
+    font-family: 'JetBrains Mono', monospace; font-size: 0.72rem;
+    letter-spacing: 0.14em; text-transform: uppercase; color: var(--hva-accent2);
+    margin-bottom: 8px; border-bottom: 1px dashed var(--hva-border); padding-bottom: 6px;
+}}
 
-            with st.container(key="stats_card"):
-                pw, ps = n_w / total * 100, n_s / total * 100
-                st.markdown(f"""
-                <div class="st-title">STATS · for ₹{budget_lakh} L</div>
-                <div class="st-grid">
-                  <div class="st-rows">
-                    <div class="st-row" style="background:#fff">TOTAL <b>{total}</b></div>
-                    <div class="st-row" style="background:{RED}">OVER <b>{n_o}</b></div>
-                    <div class="st-row" style="background:{YELLOW}">STRETCH <b>{n_s}</b></div>
-                    <div class="st-row" style="background:{GREEN}">WITHIN <b>{n_w}</b></div>
-                  </div>
-                  <div class="st-donutbox"><div class="donut" style="background:conic-gradient({GREEN} 0 {pw:.1f}%, {YELLOW} {pw:.1f}% {pw+ps:.1f}%, {RED} {pw+ps:.1f}% 100%)"></div></div>
-                </div>
-                """, unsafe_allow_html=True)
+/* Inputs */
+[data-testid="stNumberInput"] input,
+[data-testid="stSelectbox"] div[data-baseweb="select"] > div,
+[data-testid="stTextInput"] input {{
+    background: var(--hva-input) !important;
+    border: 1px solid var(--hva-border) !important;
+    border-radius: 8px !important;
+    color: var(--hva-text) !important;
+}}
+[data-testid="stSlider"] [role="slider"] {{ background-color: var(--hva-accent2) !important; box-shadow: 0 0 8px rgba(227,178,60,0.5) !important; }}
+[data-testid="stSlider"] > div > div > div > div {{ background: linear-gradient(90deg, var(--hva-accent), var(--hva-accent2)) !important; }}
 
-        st.caption("Pins show approximate locality centres. Colours update live with your budget and property specs.")
+/* Buttons */
+.stButton > button {{
+    background: linear-gradient(90deg, var(--hva-accent), var(--hva-accent2)) !important;
+    color: #0A1220 !important;
+    border: none !important;
+    border-radius: 10px !important;
+    font-family: 'Space Grotesk', sans-serif !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.05em;
+    padding: 0.7rem 1rem !important;
+    box-shadow: 0 4px 18px rgba(142,202,230,0.3);
+    transition: all 0.2s ease;
+}}
+.stButton > button:hover {{ transform: translateY(-2px); box-shadow: 0 8px 26px rgba(227,178,60,0.4); }}
+.stButton > button:active {{ transform: translateY(0) scale(0.98); }}
 
-        # --- info for the place picked in "Find a place" -------------------
-        fp = st.session_state["find_place"]
-        if fp != OVERVIEW:
-            kind, name = fp.split("::")
-            if kind == "loc":
-                r = loc_row(name)
-                p = float(map_df.loc[map_df["location"] == name, "pred"].iloc[0])
-                st.markdown(f'<div class="place-info"><b>{name}</b> · {r["tier"]} · about ₹{int(r["rate_per_sqft"]):,}/sq ft · '
-                            f'{r["distance_to_city_km"]:.1f} km from Civil Lines<br>{r["note"]}<br>'
-                            f'Estimate for your specs here: <b>{format_inr(p)}</b> ({short_inr(p)})</div>', unsafe_allow_html=True)
-            else:
-                r = lm_df[lm_df["name"] == name].iloc[0]
-                nr = loc_row(r["nearest_locality"])
-                p = float(map_df.loc[map_df["location"] == r["nearest_locality"], "pred"].iloc[0])
-                st.markdown(f'<div class="place-info"><b>{name}</b> · {r["note"]}<br>Nearest locality: {r["nearest_locality"]} '
-                            f'(about ₹{int(nr["rate_per_sqft"]):,}/sq ft). Your specs there: <b>{short_inr(p)}</b></div>',
-                            unsafe_allow_html=True)
+/* KPI sparkline cards */
+.kpi-card {{
+    background: var(--hva-glass); border: 1px solid var(--hva-border); border-radius: 14px;
+    padding: 14px 16px; backdrop-filter: blur(10px); animation: fadeUp 0.5s ease;
+}}
+.kpi-label {{ font-family: 'JetBrains Mono', monospace; font-size: 0.68rem; color: var(--hva-muted); text-transform: uppercase; letter-spacing: 0.08em; }}
+.kpi-value {{ font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 1.4rem; color: var(--hva-text); margin-top: 2px; }}
 
-        # --- estimate + house + afford table ------------------------------
-        e1, e2 = st.columns([1, 1], gap="medium")
-        with e1:
-            with st.container(key="card_estimate"):
-                st.markdown(f'<div class="card-title">Estimate · {location}</div>', unsafe_allow_html=True)
-                if st.session_state["has_predicted"]:
-                    tier_name, tier_level = price_tier(est, stats)
-                    rate = float(loc_row(location)["rate_per_sqft"])
-                    st.markdown(puzzle_reveal_html(
-                        format_inr(est), f"{tier_name} · ≈ {short_inr(est)} · typical error ±{short_inr(best_mae)}",
-                        f"est{st.session_state['reveal_counter']}"), unsafe_allow_html=True)
-                    for b in explain_price(est_row, stats, rate):
-                        st.markdown(f"- {b}")
-                    if est <= budget:
-                        st.caption(f"✅ Within your ₹{budget_lakh} L budget.")
-                    else:
-                        st.caption(f"⚠️ About {short_inr(est - budget)} above your ₹{budget_lakh} L budget.")
-                else:
-                    st.markdown("Pick a locality and press **Reveal my estimate**.")
-        with e2:
-            with st.container(key="card_house"):
-                st.markdown('<div class="card-title">Your house, visualised</div>', unsafe_allow_html=True)
-                if st.session_state["has_predicted"]:
-                    _, lvl = price_tier(est, stats)
-                    st.markdown(render_house_svg(lvl, garage, garden, lift), unsafe_allow_html=True)
-                    traits = get_quality_traits(loc_row(location)["note"], garage, garden, lift,
-                                                near_school, age, float(loc_row(location)["distance_to_city_km"]))
-                    st.markdown("".join(f'<span class="pill">{t}</span>' for t in traits), unsafe_allow_html=True)
-                else:
-                    st.markdown("Your house appears here after the estimate is revealed.")
+/* House illustration wrap */
+.house-illustration {{
+    animation: slideInImg 0.6s ease;
+    text-align: center;
+}}
+.house-illustration img, .house-illustration svg {{ animation: flashPop 0.7s ease; border-radius: 12px; }}
 
-        # --- EMI calculator + rent vs buy ----------------------------------
-        with st.container(key="card_emi"):
-            st.markdown('<div class="card-title">EMI calculator and rent vs buy</div>', unsafe_allow_html=True)
-            if st.session_state["has_predicted"]:
-                m1, m2, m3 = st.columns(3)
-                with m1:
-                    down_pct = st.slider("Down payment (%)", 0, 90, 20, step=5, key="emi_down")
-                with m2:
-                    rate_pa = st.number_input("Interest rate (% per year)", 5.0, 15.0, 8.75, step=0.05, key="emi_rate")
-                with m3:
-                    years = st.slider("Loan years", 5, 30, 20, key="emi_years")
+/* Diff callout */
+.diff-callout {{
+    border-left: 3px solid var(--hva-accent2);
+    background: var(--hva-glass);
+    padding: 10px 14px; border-radius: 8px; font-family: 'JetBrains Mono', monospace;
+    font-size: 0.82rem; margin-top: 10px; animation: fadeUp 0.5s ease;
+}}
 
-                down_amt = est * down_pct / 100
-                loan = est - down_amt
-                mr = rate_pa / 12 / 100          # monthly rate
-                n = years * 12                   # number of EMIs
-                emi = loan / n if mr == 0 else loan * mr * (1 + mr) ** n / ((1 + mr) ** n - 1)
-                total_interest = emi * n - loan
+.trait-pill {{
+    display: inline-block; padding: 4px 10px; margin: 3px 4px 3px 0;
+    border: 1px solid var(--hva-border); border-radius: 999px;
+    font-family: 'JetBrains Mono', monospace; font-size: 0.72rem;
+    background: rgba(142,202,230,0.08); color: var(--hva-text);
+}}
 
-                c_a, c_b, c_c = st.columns(3)
-                for col, (label, value) in zip([c_a, c_b, c_c], [
-                    ("Monthly EMI", format_inr(emi)),
-                    ("Loan amount", short_inr(loan)),
-                    ("Total interest", short_inr(total_interest)),
-                ]):
-                    col.markdown(f'<div class="kpi"><div class="kpi-label">{label}</div>'
-                                 f'<div class="kpi-value">{value}</div></div>', unsafe_allow_html=True)
-
-                st.markdown('<div class="panel-sub">Rent vs buy</div>', unsafe_allow_html=True)
-                r1, r2 = st.columns(2)
-                with r1:
-                    yield_pct = st.slider("Rental yield (% of price per year)", 1.5, 5.0, 3.0, step=0.1, key="rb_yield")
-                with r2:
-                    growth = st.slider("Yearly price and rent growth (%)", 0.0, 10.0, 5.0, step=0.5, key="rb_growth")
-
-                rent = est * yield_pct / 100 / 12
-                g = growth / 100
-                breakeven = None
-                for t in range(1, 31):
-                    k = t * 12
-                    if k >= n:
-                        bal = 0
-                    elif mr == 0:
-                        bal = loan - emi * k
-                    else:
-                        bal = loan * (1 + mr) ** k - emi * ((1 + mr) ** k - 1) / mr
-                    paid = emi * min(k, n)
-                    home_value = est * (1 + g) ** t
-                    buy_cost = down_amt + paid - (home_value - bal)   # money spent minus equity owned
-                    rent_cost = sum(rent * 12 * (1 + g) ** y for y in range(t))
-                    if buy_cost <= rent_cost:
-                        breakeven = t
-                        break
-
-                d1, d2 = st.columns(2)
-                d1.markdown(f'<div class="kpi"><div class="kpi-label">Estimated monthly rent</div>'
-                            f'<div class="kpi-value">{format_inr(rent)}</div></div>', unsafe_allow_html=True)
-                d2.markdown(f'<div class="kpi"><div class="kpi-label">Buying beats renting after</div>'
-                            f'<div class="kpi-value">{f"{breakeven} years" if breakeven else "30+ years"}</div></div>',
-                            unsafe_allow_html=True)
-                st.caption("Simple estimate: it ignores taxes, maintenance and what your down payment could earn elsewhere. "
-                           "Rental yield and growth are assumptions you can change above.")
-            else:
-                st.markdown("Press **Reveal my estimate** first, then set your loan details here.")
-
-        with st.container(key="card_afford"):
-            st.markdown('<div class="card-title">Where can you buy this home? (all Prayagraj localities)</div>', unsafe_allow_html=True)
-            tbl = map_df.sort_values("pred")[["location", "tier", "rate_per_sqft", "pred", "status"]].copy()
-            tbl["Estimate"] = tbl["pred"].map(lambda v: f"{format_inr(v)}  ({short_inr(v)})")
-            tbl["Status"] = tbl["status"].map(lambda s: STATUS_META[s]["label"])
-            tbl["Base rate"] = tbl["rate_per_sqft"].map(lambda v: f"₹{int(v):,}/sq ft")
-            tbl = tbl.rename(columns={"location": "Locality", "tier": "Segment"})[
-                ["Locality", "Segment", "Base rate", "Estimate", "Status"]]
-            st.dataframe(tbl, hide_index=True, width="stretch", height=330)
-
-# ===========================================================================
-# TAB 2 — COMPARE
-# ===========================================================================
-with tab_compare:
-    st.markdown("Compare two properties anywhere in Prayagraj.")
-    colA, colB = st.columns(2, gap="large")
-
-    def property_form(prefix, default_area, default_loc):
-        with st.container(key=f"card_form_{prefix}"):
-            st.markdown(f'<div class="card-title">Property {prefix}</div>', unsafe_allow_html=True)
-            ar = st.number_input("Area (sq ft)", 400, 6000, default_area, step=50, key=f"{prefix}_area")
-            c1, c2 = st.columns(2)
-            with c1:
-                bed = st.selectbox("Bedrooms", [1, 2, 3, 4, 5, 6], index=2, key=f"{prefix}_bed")
-                ag = st.slider("Age (yrs)", 0, 60, 10, key=f"{prefix}_age")
-            with c2:
-                bath = st.selectbox("Bathrooms", [1, 2, 3, 4], index=1, key=f"{prefix}_bath")
-                lc = st.selectbox("Locality", LOC_NAMES, index=LOC_NAMES.index(default_loc), key=f"{prefix}_loc")
-            k1, k2, k3, k4 = st.columns(4)
-            with k1:
-                g = st.checkbox("Parking", True, key=f"{prefix}_garage")
-            with k2:
-                ga = st.checkbox("Garden", False, key=f"{prefix}_garden")
-            with k3:
-                li = st.checkbox("Lift", False, key=f"{prefix}_lift")
-            with k4:
-                sc = st.checkbox("School", True, key=f"{prefix}_school")
-        return (ar, bed, bath, ag, lc, g, ga, li, sc)
-
-    with colA:
-        specs_a = property_form("A", 1400, "Civil Lines")
-    with colB:
-        specs_b = property_form("B", 1400, "Naini")
-
-    def _cmp():
-        st.session_state["has_compared"] = True
-        st.session_state["reveal_counter_cmp"] += 1
-
-    st.button("Compare properties", width="stretch", key="cmp_btn", on_click=_cmp)
-
-    if st.session_state["has_compared"]:
-        pa, ra = predict_one(specs_a)
-        pb, rb = predict_one(specs_b)
-        a_wins = pa >= pb
-        rc = st.session_state["reveal_counter_cmp"]
-        rA, rB = st.columns(2, gap="large")
-        with rA:
-            with st.container(key="card_res_a"):
-                st.markdown(f'<div class="card-title">Property A · {specs_a[4]}</div>', unsafe_allow_html=True)
-                st.markdown(puzzle_reveal_html(format_inr(pa), f"≈ {short_inr(pa)}", f"cmpA{rc}"), unsafe_allow_html=True)
-                if a_wins:
-                    st.markdown('<span class="win-badge">🏆 Higher value</span>', unsafe_allow_html=True)
-        with rB:
-            with st.container(key="card_res_b"):
-                st.markdown(f'<div class="card-title">Property B · {specs_b[4]}</div>', unsafe_allow_html=True)
-                st.markdown(puzzle_reveal_html(format_inr(pb), f"≈ {short_inr(pb)}", f"cmpB{rc}"), unsafe_allow_html=True)
-                if not a_wins:
-                    st.markdown('<span class="win-badge">🏆 Higher value</span>', unsafe_allow_html=True)
-
-        hi, lo = (ra, rb) if a_wins else (rb, ra)
-        rate_hi, rate_lo = float(loc_row(hi["location"])["rate_per_sqft"]), float(loc_row(lo["location"])["rate_per_sqft"])
-        reasons = []
-        if abs(hi["area_sqft"] - lo["area_sqft"]) > 50:
-            reasons.append((abs(hi["area_sqft"] - lo["area_sqft"]) * rate_lo,
-                            f"{abs(hi['area_sqft'] - lo['area_sqft']):.0f} sq ft {'more' if hi['area_sqft'] > lo['area_sqft'] else 'less'} area"))
-        if hi["location"] != lo["location"]:
-            reasons.append((abs(rate_hi - rate_lo) * min(hi["area_sqft"], lo["area_sqft"]),
-                            f"{hi['location']} (₹{rate_hi:,.0f}/sq ft) vs {lo['location']} (₹{rate_lo:,.0f}/sq ft)"))
-        if abs(lo["age_years"] - hi["age_years"]) > 3:
-            reasons.append((abs(lo["age_years"] - hi["age_years"]) * 0.007 * max(pa, pb),
-                            f"being {abs(lo['age_years'] - hi['age_years'])} years {'newer' if lo['age_years'] > hi['age_years'] else 'older'}"))
-        amen = lambda r: r["garage"] + r["garden"] + r["lift"] + r["near_school"]
-        if amen(hi) != amen(lo):
-            reasons.append((abs(amen(hi) - amen(lo)) * 3e5, f"{abs(amen(hi) - amen(lo))} {'more' if amen(hi) > amen(lo) else 'fewer'} amenities"))
-        reasons.sort(key=lambda r: -r[0])
-        main = reasons[0][1] if reasons else "small differences in specifications"
-        st.markdown(f'<div class="callout">Property {"A" if a_wins else "B"} costs <b>{format_inr(abs(pa - pb))}</b> '
-                    f'({short_inr(abs(pa - pb))}) more, mainly due to {main}.</div>', unsafe_allow_html=True)
-
-# ===========================================================================
-# TAB 3 — INSIGHTS
-# ===========================================================================
-with tab_insights:
-    k1, k2, k3, k4 = st.columns(4)
-    for col, (label, value) in zip([k1, k2, k3, k4], [
-        ("Median price", short_inr(stats["price_quantiles"][0.5])),
-        ("Median area", f"{stats['area_median']:,.0f} sq ft"),
-        ("Median rate", f"₹{stats['rate_median']:,.0f}/sq ft"),
-        ("Localities", f"{len(loc_df)}"),
-    ]):
-        col.markdown(f'<div class="kpi"><div class="kpi-label">{label}</div><div class="kpi-value">{value}</div></div>',
-                     unsafe_allow_html=True)
-    st.write("")
-
-    def style_fig(fig, h=340):
-        fig.update_layout(height=h, margin=dict(l=10, r=10, t=10, b=10), paper_bgcolor="rgba(0,0,0,0)",
-                          plot_bgcolor="#fff", font=dict(family="Space Grotesk", color=INK))
-        return fig
-
-    with st.container(key="card_rate"):
-        st.markdown('<div class="card-title">Base price per sq ft by locality (₹)</div>', unsafe_allow_html=True)
-        tmp = loc_df.sort_values("rate_per_sqft")
-        fb = px.bar(tmp, x="rate_per_sqft", y="location", orientation="h", color="tier",
-                    color_discrete_map={"Premium": RED, "Mid-range": YELLOW, "Affordable": GREEN},
-                    template="plotly_white")
-        fb.update_traces(marker_line_color=INK, marker_line_width=2)
-        fb.update_layout(xaxis_title="₹ per sq ft", yaxis_title="", legend_title="")
-        st.plotly_chart(style_fig(fb, 620), key="bar_rate")
-        st.caption("Rates come from 99acres / Housing.com locality pages (mid-2026) where available; "
-                   "the two sites often disagree, so treat these as working figures. "
-                   "Localities marked 'estimate' in locality_info.csv had no clear public figure.")
-
-    i1, i2 = st.columns(2, gap="large")
-    with i1:
-        with st.container(key="card_hist"):
-            st.markdown('<div class="card-title">Price distribution (₹ lakh)</div>', unsafe_allow_html=True)
-            d2 = df.assign(price_lakh=df["price"] / 1e5)
-            fh = px.histogram(d2, x="price_lakh", nbins=40, template="plotly_white", color_discrete_sequence=[BLUE])
-            fh.update_traces(marker_line_color=INK, marker_line_width=1.5)
-            fh.update_layout(xaxis_title="Price (₹ lakh)", yaxis_title="Count")
-            st.plotly_chart(style_fig(fh), key="hist")
-    with i2:
-        with st.container(key="card_scatter"):
-            st.markdown('<div class="card-title">Area vs price by segment</div>', unsafe_allow_html=True)
-            d3 = df.merge(loc_df[["location", "tier"]], on="location").assign(price_lakh=lambda x: x["price"] / 1e5)
-            fs = px.scatter(d3.sample(min(900, len(d3)), random_state=1), x="area_sqft", y="price_lakh", color="tier",
-                            color_discrete_map={"Premium": RED, "Mid-range": YELLOW, "Affordable": GREEN},
-                            template="plotly_white", opacity=0.8)
-            fs.update_layout(xaxis_title="Area (sq ft)", yaxis_title="Price (₹ lakh)", legend_title="")
-            st.plotly_chart(style_fig(fs), key="scatter")
-
-    with st.container(key="card_lm"):
-        st.markdown('<div class="card-title">Famous places and what nearby homes cost</div>', unsafe_allow_html=True)
-        lm_tbl = lm_df.merge(loc_df[["location", "rate_per_sqft"]], left_on="nearest_locality", right_on="location")
-        lm_tbl["Base rate nearby"] = lm_tbl["rate_per_sqft"].map(lambda v: f"₹{int(v):,}/sq ft")
-        lm_tbl = lm_tbl.rename(columns={"name": "Place", "note": "About", "nearest_locality": "Nearest locality"})
-        st.dataframe(lm_tbl[["Place", "About", "Nearest locality", "Base rate nearby"]], hide_index=True,
-                     width="stretch")
-
-    with st.expander("Dataset preview and model performance"):
-        prev = df.head(25).copy()
-        prev["price"] = prev["price"].map(lambda v: f"₹{indian_grouping(round(v))}")
-        st.dataframe(prev, width="stretch", height=300)
-        mdf = pd.DataFrame(meta["metrics"]).T
-        mdf["MAE (₹ lakh)"] = (mdf["MAE"] / 1e5).round(2)
-        mdf["RMSE (₹ lakh)"] = (mdf["RMSE"] / 1e5).round(2)
-        mdf["R²"] = mdf["R2"].round(3)
-        st.dataframe(mdf[["MAE (₹ lakh)", "RMSE (₹ lakh)", "R²"]], width="stretch")
-        st.caption("The best model is chosen by lowest MAE (typical error in rupees).")
-
-st.write("")
-st.markdown(f"""
-<div style="text-align:center; font-family:'Space Mono',monospace; font-size:0.72rem; padding:10px 0 24px 0;">
-HomeValue AI · Prayagraj · {best_model_name} · Indicative estimates from a synthetic dataset calibrated to 2026 listing rates, not a valuation · {datetime.date.today():%d %b %Y}
-</div>""", unsafe_allow_html=True)
+[data-testid="stExpander"] {{ border: 1px solid var(--hva-border) !important; background: var(--hva-glass) !important; border-radius: 12px !important; }}
+[data-testid="stTabs"] button[role="tab"] {{ font-family: 'Space Grotesk', sans-serif; font-weight: 600; }}
+[data-testid="stDataFrame"] {{ border-radius: 10px; overflow: hidden; }}
+</style>
+"""
