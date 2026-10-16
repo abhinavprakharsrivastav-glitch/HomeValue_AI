@@ -328,7 +328,7 @@ map_df["tier"] = [price_tier(p, stats)[0] for p in preds]
 # RIGHT: TABS
 # ---------------------------------------------------------------------------
 with right:
-    tab_map, tab_cmp, tab_ins, tab_emi = st.tabs(["Map", "Compare", "Insights", "EMI calculator"])
+    tab_map, tab_cmp, tab_emi, tab_ins = st.tabs(["Map", "Compare", "EMI calculator", "Insights"])
 
     # ======================= MAP TAB =======================
     with tab_map:
@@ -541,75 +541,98 @@ with right:
 
     # ======================= EMI TAB =======================
     with tab_emi:
-        default_price = int(round(price_main, -3)) if valid_main else 5000000
+        # Price follows the latest estimate; down payment follows the budget.
+        # Both stay editable by hand until the estimate / budget changes again.
+        est_price = int(round(price_main, -3)) if (st.session_state["has_predicted"] and valid_main) else None
+        if st.session_state.get("_emi_est") != est_price:
+            st.session_state["_emi_est"] = est_price
+            st.session_state["emi_price"] = est_price
+        if st.session_state.get("_emi_budget") != budget:
+            st.session_state["_emi_budget"] = budget
+            st.session_state["emi_down"] = int(budget)
+        st.session_state.setdefault("emi_price", est_price)
+        st.session_state.setdefault("emi_down", int(budget))
+
         e1, e2 = st.columns([1, 2], gap="large")
         with e1:
             with st.container(key="card_emi_in"):
                 st.markdown('<div class="card-title">Loan details</div>', unsafe_allow_html=True)
-                if not valid_main:
-                    st.warning("Enter a valid area on the left to start from your estimated price.")
                 price_in = st.number_input("Property price (₹)", min_value=100000, max_value=1000000000,
-                                           value=max(default_price, 100000), step=100000, key="emi_price")
-                down_pct = st.slider("Down payment (%)", 0, 90, 20, key="emi_down")
+                                           step=100000, key="emi_price",
+                                           placeholder="Reveal an estimate or type a price")
+                if est_price is not None and price_in == est_price:
+                    st.caption(f"Taken from your estimate for {loc_sel}")
+                down_in = st.number_input("Down payment (₹) — from your budget", min_value=0,
+                                          max_value=1000000000, step=100000, key="emi_down")
                 rate = st.slider("Interest rate (% per year)", 5.0, 15.0, 8.5, 0.05, key="emi_rate")
                 years = st.slider("Tenure (years)", 1, 30, 20, key="emi_years")
                 income = st.number_input("Monthly income (₹, optional)", min_value=0, value=0,
                                          step=5000, key="emi_income")
 
-        down = price_in * down_pct / 100
-        loan = price_in - down
-        n = years * 12
-        r = rate / 12 / 100
-        emi_val = loan / n if r == 0 else loan * r * (1 + r) ** n / ((1 + r) ** n - 1)
-        total_pay = emi_val * n
-        total_int = total_pay - loan
-
         with e2:
-            k1, k2, k3, k4 = st.columns(4)
-            for col, label, val in (
-                (k1, "Monthly EMI", format_inr(emi_val)),
-                (k2, "Loan amount", short_inr(loan)),
-                (k3, "Total interest", short_inr(total_int)),
-                (k4, "Total payable", short_inr(total_pay))):
-                col.markdown(f'<div class="kpi"><div class="kpi-label">{label}</div>'
-                             f'<div class="kpi-value" style="font-size:1.05rem">{val}</div></div>',
-                             unsafe_allow_html=True)
+            if price_in is None:
+                st.info("Go to the **Map** tab, enter your property details and press **Reveal my estimate** — "
+                        "the price will appear here automatically. You can also type a price yourself.")
+            else:
+                down = min(float(down_in), float(price_in))
+                loan = float(price_in) - down
+                n = years * 12
+                r = rate / 12 / 100
+                if loan <= 0:
+                    emi_val = total_pay = total_int = 0.0
+                else:
+                    emi_val = loan / n if r == 0 else loan * r * (1 + r) ** n / ((1 + r) ** n - 1)
+                    total_pay = emi_val * n
+                    total_int = total_pay - loan
 
-            if income > 0:
-                ratio = emi_val / income * 100
-                msg = (f"EMI is <b>{ratio:.0f}%</b> of your monthly income. "
-                       + ("Comfortable (under 40%)." if ratio <= 40 else
-                          "High — lenders usually prefer EMI under 40-50% of income."))
-                st.markdown(f'<div class="callout">{msg}</div>', unsafe_allow_html=True)
-            if price_in > budget:
-                st.markdown(f'<div class="callout">This price is {short_inr(price_in - budget)} above your '
-                            f'budget of {short_inr(budget)}. A larger down payment may help.</div>',
-                            unsafe_allow_html=True)
+                k1, k2, k3, k4 = st.columns(4)
+                for col, label, val in (
+                    (k1, "Monthly EMI", format_inr(emi_val)),
+                    (k2, "Loan amount", short_inr(loan)),
+                    (k3, "Total interest", short_inr(total_int)),
+                    (k4, "Total payable", short_inr(total_pay))):
+                    col.markdown(f'<div class="kpi"><div class="kpi-label">{label}</div>'
+                                 f'<div class="kpi-value" style="font-size:1.05rem">{val}</div></div>',
+                                 unsafe_allow_html=True)
 
-            g1, g2 = st.columns(2)
-            with g1:
-                with st.container(key="card_emi_pie"):
-                    st.markdown('<div class="card-title">Where your money goes</div>', unsafe_allow_html=True)
-                    pie = px.pie(names=["Down payment", "Loan principal", "Interest"],
-                                 values=[down, loan, total_int], hole=0.5,
-                                 color_discrete_sequence=[TEAL, BLUE, PINK])
-                    pie.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0), paper_bgcolor="rgba(0,0,0,0)")
-                    st.plotly_chart(pie, width="stretch")
-            with g2:
-                with st.container(key="card_emi_bal"):
-                    st.markdown('<div class="card-title">Outstanding loan by year</div>', unsafe_allow_html=True)
-                    bal, rows = loan, [(0, loan)]
-                    for y in range(1, years + 1):
-                        for _ in range(12):
-                            bal = bal * (1 + r) - emi_val
-                        rows.append((y, max(bal, 0)))
-                    bal_df = pd.DataFrame(rows, columns=["Year", "Balance"])
-                    ln = px.area(bal_df, x="Year", y="Balance", color_discrete_sequence=[BLUE])
-                    ln.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0), paper_bgcolor="rgba(0,0,0,0)",
-                                     plot_bgcolor="#fff", yaxis_title="₹ outstanding")
-                    st.plotly_chart(ln, width="stretch")
-            st.caption("EMI = P × r × (1+r)ⁿ / ((1+r)ⁿ − 1), r = monthly rate, n = months. "
-                       "Indicative only — banks add processing fees and may change rates.")
+                if loan <= 0:
+                    st.markdown(f'<div class="callout">Your down payment of {short_inr(down_in)} covers the '
+                                f'full price of {short_inr(price_in)} — no loan needed.</div>',
+                                unsafe_allow_html=True)
+                else:
+                    st.caption(f"Price {short_inr(price_in)} − down payment {short_inr(down)} "
+                               f"({down / price_in * 100:.0f}%) = loan {short_inr(loan)}")
+                    if income > 0:
+                        ratio = emi_val / income * 100
+                        msg = (f"EMI is <b>{ratio:.0f}%</b> of your monthly income. "
+                               + ("Comfortable (under 40%)." if ratio <= 40 else
+                                  "High — lenders usually prefer EMI under 40-50% of income."))
+                        st.markdown(f'<div class="callout">{msg}</div>', unsafe_allow_html=True)
+
+                    g1, g2 = st.columns(2)
+                    with g1:
+                        with st.container(key="card_emi_pie"):
+                            st.markdown('<div class="card-title">Where your money goes</div>', unsafe_allow_html=True)
+                            pie = px.pie(names=["Down payment", "Loan principal", "Interest"],
+                                         values=[down, loan, total_int], hole=0.5,
+                                         color_discrete_sequence=[TEAL, BLUE, PINK])
+                            pie.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0), paper_bgcolor="rgba(0,0,0,0)")
+                            st.plotly_chart(pie, width="stretch")
+                    with g2:
+                        with st.container(key="card_emi_bal"):
+                            st.markdown('<div class="card-title">Outstanding loan by year</div>', unsafe_allow_html=True)
+                            bal, rows = loan, [(0, loan)]
+                            for y in range(1, years + 1):
+                                for _ in range(12):
+                                    bal = bal * (1 + r) - emi_val
+                                rows.append((y, max(bal, 0)))
+                            bal_df = pd.DataFrame(rows, columns=["Year", "Balance"])
+                            ln = px.area(bal_df, x="Year", y="Balance", color_discrete_sequence=[BLUE])
+                            ln.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0), paper_bgcolor="rgba(0,0,0,0)",
+                                             plot_bgcolor="#fff", yaxis_title="₹ outstanding")
+                            st.plotly_chart(ln, width="stretch")
+                st.caption("EMI = P × r × (1+r)ⁿ / ((1+r)ⁿ − 1), r = monthly rate, n = months. "
+                           "Indicative only — banks add processing fees and may change rates.")
 
 
 st.caption(f"HomeValue AI · {best_model_name} model trained on a synthetic Prayagraj dataset · "
