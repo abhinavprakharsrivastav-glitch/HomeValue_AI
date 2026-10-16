@@ -28,40 +28,6 @@ STATUS_META = {
 
 
 # ---------------------------------------------------------------------------
-# ROOMS FROM AREA  ("basic idea" of bedrooms / bathrooms for any land size)
-# ---------------------------------------------------------------------------
-# Follows the same relationship the training data was built on
-# (about 1 bedroom per 480 sq ft, bathrooms ~ 0.75 x bedrooms) and keeps
-# growing smoothly for very large areas instead of stopping at 6 / 4,
-# so 1,200 sq ft and 12,000 sq ft give clearly different answers.
-SQFT_PER_BEDROOM = 480          # up to the largest size in the data
-BIG_HOME_SQFT = 2900            # ~6 bedrooms; beyond this homes get roomier
-SQFT_PER_EXTRA_BEDROOM = 1500   # one extra bedroom per this much extra area
-BATH_PER_BEDROOM = 0.75
-
-
-def _round_half_down(x: float) -> int:
-    return int(math.ceil(x - 0.5))
-
-
-def suggest_rooms(area_sqft: float) -> dict:
-    """Basic idea of bedrooms / bathrooms for a given area (sq ft)."""
-    area = max(float(area_sqft), 0.0)
-    if area <= BIG_HOME_SQFT:
-        beds = _round_half_down(area / SQFT_PER_BEDROOM)
-    else:
-        base = _round_half_down(BIG_HOME_SQFT / SQFT_PER_BEDROOM)
-        beds = base + _round_half_down((area - BIG_HOME_SQFT) / SQFT_PER_EXTRA_BEDROOM)
-    beds = max(1, beds)
-    baths = max(1, int(math.floor(beds * BATH_PER_BEDROOM + 0.5)))  # half rounds up
-    if beds >= 7:
-        label = f"{beds} BHK large home / bungalow"
-    else:
-        label = f"{beds} BHK"
-    return {"bedrooms": beds, "bathrooms": baths, "label": label}
-
-
-# ---------------------------------------------------------------------------
 # CURRENCY
 # ---------------------------------------------------------------------------
 def indian_grouping(n) -> str:
