@@ -321,6 +321,10 @@ div[class*="st-key-card_"] {{ background:#fff; border:3px solid {INK}; box-shado
 [data-baseweb="input"], [data-baseweb="select"] > div {{ border:3px solid {INK} !important; border-radius:0 !important; background:#fff !important; }}
 [data-baseweb="base-input"] {{ background:#fff !important; }}
 [data-testid="stNumberInput"] input, [data-baseweb="select"] div {{ color:{INK} !important; font-weight:600; }}
+/* multiselect chips: readable label on a yellow chip (was black text on black) */
+[data-baseweb="tag"] {{ background:{YELLOW} !important; border:2px solid {INK} !important; border-radius:0 !important; }}
+[data-baseweb="tag"], [data-baseweb="tag"] span, [data-baseweb="tag"] div {{ color:{INK} !important; font-weight:700 !important; }}
+[data-baseweb="tag"] svg {{ fill:{INK} !important; color:{INK} !important; }}
 [data-baseweb="popover"] li, [data-baseweb="popover"] ul {{ background:#fff !important; color:{INK} !important; font-weight:600; }}
 [data-testid="stCheckbox"] label p {{ font-weight:700 !important; font-size:0.82rem !important; text-transform:none; letter-spacing:0; }}
 [data-baseweb="checkbox"] > span:first-child {{ border:3px solid {INK} !important; border-radius:0 !important; background:#fff !important; }}
