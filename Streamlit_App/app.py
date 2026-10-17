@@ -175,6 +175,19 @@ def map_view(find_place):
     return float(r["lat"]), float(r["lon"]), 14.2
 
 
+def fit_view(points, width_px=900, height_px=660, pad=0.5):
+    """Centre + zoom that keeps every (lat, lon) point on screen."""
+    import math
+    lats = [p[0] for p in points]; lons = [p[1] for p in points]
+    lat0, lat1, lon0, lon1 = min(lats), max(lats), min(lons), max(lons)
+    clat, clon = (lat0 + lat1) / 2, (lon0 + lon1) / 2
+    span_lat = max(lat1 - lat0, 0.004); span_lon = max(lon1 - lon0, 0.004)
+    cosf = math.cos(math.radians(clat))
+    z_lon = math.log2(width_px * 360 / (512 * span_lon))
+    z_lat = math.log2(height_px * 360 * cosf / (512 * span_lat))
+    return clat, clon, max(10.0, min(13.5, min(z_lon, z_lat) - pad))
+
+
 def build_map(map_df, visible, show_lm, find_place, tilt, focus_loc, focus_text):
     fig = go.Figure()
     vis = map_df[map_df["status"].isin(visible)]
@@ -224,6 +237,11 @@ def build_map(map_df, visible, show_lm, find_place, tilt, focus_loc, focus_text)
                                     hoverinfo="skip", showlegend=False))
 
     lat, lon, zoom = map_view(find_place)
+    if find_place == OVERVIEW and not vis.empty and len(vis) < len(map_df):
+        pts = list(zip(vis["lat"].astype(float), vis["lon"].astype(float)))
+        if focus_loc is not None:
+            r = loc_row(focus_loc); pts.append((float(r["lat"]), float(r["lon"])))
+        lat, lon, zoom = fit_view(pts)
     fig.update_layout(
         map=dict(style="open-street-map", center=dict(lat=lat, lon=lon), zoom=zoom,
                  pitch=55 if tilt else 0, bearing=-15 if tilt else 0),
@@ -356,6 +374,11 @@ with right:
             t4.button("Toggle 3D tilt", key="btn_tilt", on_click=_toggle_tilt, width="stretch")
             t5.write("")
             t5.button("Reset view", key="btn_reset", on_click=_reset_view, width="stretch")
+
+            for _k in visible:
+                _names = map_df.loc[map_df["status"] == _k, "location"].tolist()
+                if _names and len(visible) < len(STATUS_META):
+                    st.caption(f"{STATUS_META[_k]['label']} ({len(_names)}): " + ", ".join(_names))
 
             price_main, row_main = predict_one(specs_main)
             focus_loc = loc_sel if st.session_state["has_predicted"] else None
