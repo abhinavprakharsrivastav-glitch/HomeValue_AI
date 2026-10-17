@@ -1,5 +1,14 @@
 {
   "best_model": "XGBoost",
+  "deployed_model": "XGBoost",
+  "lowest_error_model": "XGBoost",
+  "model_file": "xgb_model.json",
+  "xgboost_version_trained_with": "3.4.1",
+  "target_transform": "log1p",
+  "monotone_constraints": {
+    "age_years": -1,
+    "is_new": 1
+  },
   "feature_cols_numeric": [
     "area_sqft",
     "bedrooms",
@@ -43,24 +52,97 @@
     "Tagore Town",
     "Teliyarganj"
   ],
+  "preprocessing": {
+    "numeric_mean": [
+      1748.3840317919075,
+      3.235549132947977,
+      2.489523121387283,
+      14.165462427745664,
+      3.878453757225434,
+      5.72507225433526,
+      1.8153901734104045,
+      0.1842485549132948,
+      0.6004335260115607,
+      0.34934971098265893,
+      0.2648121387283237,
+      0.6007947976878613
+    ],
+    "numeric_scale": [
+      1592.2459864446394,
+      2.0085098908618795,
+      1.5452818562842687,
+      9.924829795138109,
+      2.8558072098998455,
+      3.4709664902274993,
+      0.9693020063719137,
+      0.3876867613494912,
+      0.48980925558107324,
+      0.4767646069277706,
+      0.44123312422171423,
+      0.48973503934174767
+    ],
+    "location_categories": [
+      "Allahpur",
+      "Alopibagh",
+      "Ashok Nagar",
+      "Bamrauli",
+      "Chowk",
+      "Civil Lines",
+      "Colonelganj",
+      "Daraganj",
+      "Dhoomanganj",
+      "George Town",
+      "Jhalwa",
+      "Jhunsi",
+      "Katra",
+      "Kydganj",
+      "Lukerganj",
+      "Mumfordganj",
+      "Muthiganj",
+      "Naini",
+      "Phaphamau",
+      "Stanley Road",
+      "Subedarganj",
+      "Sulem Sarai",
+      "Tagore Town",
+      "Teliyarganj"
+    ]
+  },
+  "training_ranges": {
+    "area_sqft": [
+      350.0,
+      12000.0
+    ],
+    "bedrooms": [
+      1,
+      13
+    ],
+    "bathrooms": [
+      1,
+      10
+    ]
+  },
   "metrics": {
     "Linear Regression": {
-      "MAE": 1023108.0300032918,
-      "MSE": 2805344665710.7114,
-      "RMSE": 1674916.3160321508,
-      "R2": 0.8868879736768374
+      "MAE": 2162857.171554794,
+      "MSE": 44812108918659.1,
+      "RMSE": 6694184.709033588,
+      "R2": 0.6933845233640294,
+      "MAPE": 0.1612666693646718
     },
     "Random Forest": {
-      "MAE": 931324.0505706088,
-      "MSE": 1919603607353.2576,
-      "RMSE": 1385497.602795926,
-      "R2": 0.9226012202996199
+      "MAE": 1342672.398276891,
+      "MSE": 7098104831404.039,
+      "RMSE": 2664226.8731104787,
+      "R2": 0.9514330200338592,
+      "MAPE": 0.11192604242777594
     },
     "XGBoost": {
-      "MAE": 708070.0858333333,
-      "MSE": 2051215598563.2246,
-      "RMSE": 1432206.548848044,
-      "R2": 0.9172945999772952
+      "MAE": 887199.7454906205,
+      "MSE": 3409337502828.3066,
+      "RMSE": 1846439.141382219,
+      "R2": 0.9766724738320155,
+      "MAPE": 0.0752959486866702
     }
   }
 }

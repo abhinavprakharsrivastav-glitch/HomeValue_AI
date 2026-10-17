@@ -10,11 +10,12 @@ import json
 import math
 import datetime
 
-import joblib
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import xgboost as xgb
 
 from utils import (
     INK, YELLOW, PINK, TEAL, BLUE, GREEN, RED, CREAM, STATUS_META,
@@ -43,14 +44,15 @@ def suggest_rooms(area_sqft):
     return {"bedrooms": beds, "bathrooms": baths, "label": label}
 
 def max_rooms(area_sqft):
-    """Most bedrooms / bathrooms that can sensibly fit: ~400 sq ft per bedroom, ~500 per bathroom."""
+    """Most bedrooms / bathrooms that can sensibly fit (~400 sq ft per bedroom, ~500 per
+    bathroom), never more than the model has seen in its training data."""
     area = max(float(area_sqft), 0.0)
-    return max(1, int(area // 400)), max(1, int(area // 500))
+    return max(1, min(int(area // 400), BED_CAP)), max(1, min(int(area // 500), BATH_CAP))
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(SCRIPT_DIR, "..", "Model", "house_price_model.pkl")
-META_PATH = os.path.join(SCRIPT_DIR, "..", "Model", "model_metadata.json")
+MODEL_DIR = os.path.join(SCRIPT_DIR, "..", "Model")
+META_PATH = os.path.join(MODEL_DIR, "model_metadata.json")
 DATA_PATH = os.path.join(SCRIPT_DIR, "..", "Dataset", "house_data_cleaned.csv")
 LOC_PATH = os.path.join(SCRIPT_DIR, "..", "Dataset", "locality_info.csv")
 LM_PATH = os.path.join(SCRIPT_DIR, "..", "Dataset", "landmarks.csv")
@@ -58,10 +60,12 @@ LM_PATH = os.path.join(SCRIPT_DIR, "..", "Dataset", "landmarks.csv")
 
 @st.cache_resource
 def load_model():
-    model = joblib.load(MODEL_PATH)
+    """XGBoost booster from its JSON export (works across XGBoost versions) + metadata."""
     with open(META_PATH) as f:
         meta = json.load(f)
-    return model, meta
+    booster = xgb.Booster()
+    booster.load_model(os.path.join(MODEL_DIR, meta["model_file"]))
+    return booster, meta
 
 
 @st.cache_data
@@ -75,6 +79,13 @@ loc_df = loc_df.reset_index(drop=True)
 best_model_name = meta["best_model"]
 best_r2 = meta["metrics"][best_model_name]["R2"]
 best_mae = meta["metrics"][best_model_name]["MAE"]
+best_mape = meta["metrics"][best_model_name]["MAPE"]
+
+# What the model has actually seen. Anything beyond this is scaled, not learned.
+_rng = meta["training_ranges"]
+AREA_FLOOR, AREA_CAP = int(_rng["area_sqft"][0]), int(_rng["area_sqft"][1])
+BED_CAP, BATH_CAP = int(_rng["bedrooms"][1]), int(_rng["bathrooms"][1])
+MIN_HOME_SQFT = 300       # below this nothing liveable can be built (smallest studio / 1 RK)
 
 stats = {
     "area_median": float(df["area_sqft"].median()),
@@ -88,13 +99,22 @@ OVERVIEW = "overview"
 # SESSION STATE + CALLBACKS
 # ---------------------------------------------------------------------------
 for k, v in {"tilt": False, "reveal_counter": 0, "reveal_counter_cmp": 0,
-             "has_predicted": False, "has_compared": False, "find_place": OVERVIEW}.items():
+             "snap": None, "show_afford": False, "has_compared": False,
+             "find_place": OVERVIEW}.items():
     st.session_state.setdefault(k, v)
 
 
 def _reveal():
-    st.session_state["has_predicted"] = True
-    st.session_state["reveal_counter"] += 1
+    """Freeze the current inputs as 'the estimate'. It only changes when pressed again."""
+    ss = st.session_state
+    ss["snap"] = (float(ss["in_area"]), int(ss["in_beds"]), int(ss["in_baths"]), int(ss["in_age"]),
+                  ss["in_loc"], bool(ss["in_garage"]), bool(ss["in_garden"]), bool(ss["in_lift"]),
+                  bool(ss["in_school"]))
+    ss["reveal_counter"] += 1
+
+
+def _toggle_afford():
+    st.session_state["show_afford"] = not st.session_state["show_afford"]
 
 
 def _toggle_tilt():
@@ -126,39 +146,81 @@ def build_input_df(area_sqft, bedrooms, bathrooms, age_years, distance_to_city_k
     return pd.DataFrame([row]), row
 
 
-# The model only saw homes up to ~5,000 sq ft, 6 bedrooms and 4 bathrooms.
-# Bigger inputs are clamped for the model and the price is scaled with area.
-AREA_CAP, BED_CAP, BATH_CAP = 5000, 6, 4
-AREA_FLOOR = 400          # smallest size in the training data (~350 sq ft)
-MIN_HOME_SQFT = 300       # below this nothing liveable can be built (smallest studio / 1 RK)
-
-
-def clamp_for_model(area, bed, bath):
-    a = min(max(area, AREA_FLOOR), AREA_CAP)
-    return a, min(bed, BED_CAP), min(bath, BATH_CAP), area / a
-
-
 def loc_row(name):
     return loc_df[loc_df["location"] == name].iloc[0]
 
 
+_PP = meta["preprocessing"]
+_NUM_COLS = meta["feature_cols_numeric"]
+_MEAN, _SCALE = np.array(_PP["numeric_mean"]), np.array(_PP["numeric_scale"])
+_CATS = np.array(_PP["location_categories"])
+_DIST = loc_df.set_index("location")["distance_to_city_km"]
+
+
+def predict_rows(area, bed, bath, age, garage, garden, lift, school, location):
+    """Prices (₹) for one or many homes. Every argument is a scalar or an array.
+
+    Sizes outside what the model has seen are clamped for the model and the price is
+    scaled with area (a 24,000 sq ft home costs about twice a 12,000 sq ft one)."""
+    area, bed, bath, age, garage, garden, lift, school, location = np.broadcast_arrays(
+        *[np.atleast_1d(np.asarray(v)) for v in (area, bed, bath, age, garage, garden, lift, school, location)])
+    area = area.astype(float)
+    m_area = np.clip(area, AREA_FLOOR, AREA_CAP)
+    m_bed, m_bath = np.minimum(bed, BED_CAP), np.minimum(bath, BATH_CAP)
+    g, ga, li, sc = (np.asarray(v).astype(int) for v in (garage, garden, lift, school))
+    frame = pd.DataFrame({
+        "area_sqft": m_area, "bedrooms": m_bed, "bathrooms": m_bath,
+        "age_years": age, "distance_to_city_km": _DIST.reindex(location).to_numpy(float),
+        "total_rooms": m_bed + m_bath, "amenity_score": g + ga + li + sc,
+        "is_new": (np.asarray(age) <= 5).astype(int),
+        "garage": g, "garden": ga, "lift": li, "near_school": sc, "location": location})
+    num = (frame[_NUM_COLS].to_numpy(float) - _MEAN) / _SCALE
+    cat = (frame["location"].to_numpy()[:, None] == _CATS[None, :]).astype(float)
+    return np.expm1(model.predict(xgb.DMatrix(np.hstack([num, cat])))) * (area / m_area)
+
+
 @st.cache_data
 def predict_all(area, bed, bath, age, garage, garden, lift, school):
-    m_area, m_bed, m_bath, scale = clamp_for_model(area, bed, bath)
-    rows = [build_input_df(m_area, m_bed, m_bath, age, r.distance_to_city_km,
-                           garage, garden, lift, school, r.location)[1]
-            for r in loc_df.itertuples()]
-    return model.predict(pd.DataFrame(rows)) * scale
+    return predict_rows(area, bed, bath, age, garage, garden, lift, school, loc_df["location"].to_numpy())
 
 
 def predict_one(specs):
     """specs = (area, bed, bath, age, locality, garage, garden, lift, school)"""
     area, bed, bath, age, loc, garage, garden, lift, school = specs
-    d = float(loc_row(loc)["distance_to_city_km"])
-    m_area, m_bed, m_bath, scale = clamp_for_model(area, bed, bath)
-    X, _ = build_input_df(m_area, m_bed, m_bath, age, d, garage, garden, lift, school, loc)
-    _, row = build_input_df(area, bed, bath, age, d, garage, garden, lift, school, loc)
-    return float(model.predict(X)[0]) * scale, row
+    price = float(predict_rows(area, bed, bath, age, garage, garden, lift, school, loc)[0])
+    _, row = build_input_df(area, bed, bath, age, float(_DIST[loc]), garage, garden, lift, school, loc)
+    return price, row
+
+
+# ---------------------------------------------------------------------------
+# WHAT CAN MY BUDGET BUY?  (largest home each locality offers for a budget)
+# ---------------------------------------------------------------------------
+AFFORD_AREAS = np.arange(MIN_HOME_SQFT, AREA_CAP + 1, 50)
+_aff_rooms = [(min(suggest_rooms(x)["bedrooms"], max_rooms(x)[0]),
+               min(suggest_rooms(x)["bathrooms"], max_rooms(x)[1])) for x in AFFORD_AREAS]
+AFFORD_BEDS = np.array([r[0] for r in _aff_rooms])
+AFFORD_BATHS = np.array([r[1] for r in _aff_rooms])
+
+
+@st.cache_data
+def what_budget_buys(budget, age, garage, garden, lift, school):
+    """For every locality: the largest home (50 sq ft steps, rooms suggested for each size)
+    whose estimated price is within `budget`. Returns one row per locality."""
+    rows = []
+    for name in loc_df["location"]:
+        p = predict_rows(AFFORD_AREAS, AFFORD_BEDS, AFFORD_BATHS, age, garage, garden, lift, school, name)
+        p = np.maximum.accumulate(p)              # a bigger home never costs less
+        ok = np.nonzero(p <= budget)[0]
+        base = {"Locality": name, "Smallest home price": float(p[0])}
+        if ok.size == 0:
+            rows.append({**base, "Area": np.nan, "Beds": np.nan, "Baths": np.nan,
+                         "Price": np.nan, "At limit": False})
+        else:
+            i = int(ok[-1])
+            rows.append({**base, "Area": float(AFFORD_AREAS[i]), "Beds": int(AFFORD_BEDS[i]),
+                         "Baths": int(AFFORD_BATHS[i]), "Price": float(p[i]),
+                         "At limit": bool(i == len(AFFORD_AREAS) - 1)})
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +323,7 @@ st.markdown(f"""
     <p class="nn-title">🏠 HomeValue AI · Prayagraj</p>
     <p class="nn-sub">House price estimates across {len(loc_df)} Prayagraj localities · prices in ₹</p>
   </div>
-  <span class="nn-badge">{best_model_name} · R² {best_r2:.3f} · MAE ₹{indian_grouping(best_mae)}</span>
+  <span class="nn-badge">{best_model_name} · R² {best_r2:.3f} · typical error ±{best_mape*100:.1f}%</span>
 </div>
 """, unsafe_allow_html=True)
 
@@ -269,15 +331,36 @@ st.markdown(f"""
 # ---------------------------------------------------------------------------
 # INPUT DEFAULTS + CALLBACKS
 # ---------------------------------------------------------------------------
-def _sync_rooms():
-    s = suggest_rooms(st.session_state["in_area"])
-    mb, mt = max_rooms(st.session_state["in_area"])
-    st.session_state["in_beds"] = min(s["bedrooms"], mb)
-    st.session_state["in_baths"] = min(s["bathrooms"], mt)
+def _apply_suggested(area_key, beds_key, baths_key):
+    area = st.session_state[area_key]
+    s, (mb, mt) = suggest_rooms(area), max_rooms(area)
+    st.session_state[beds_key] = min(s["bedrooms"], mb)
+    st.session_state[baths_key] = min(s["bathrooms"], mt)
+
+
+def _on_area_change(area_key, beds_key, baths_key, manual_key):
+    """Area changed: follow the suggestion, but never overwrite rooms the person chose."""
+    if not st.session_state[manual_key]:
+        _apply_suggested(area_key, beds_key, baths_key)
+
+
+def _mark_manual(manual_key):
+    st.session_state[manual_key] = True
+
+
+def _reset_rooms(area_key, beds_key, baths_key, manual_key):
+    st.session_state[manual_key] = False
+    _apply_suggested(area_key, beds_key, baths_key)
+
+
+def _clamp_rooms(area, beds_key, baths_key):
+    mb, mt = max_rooms(area)
+    st.session_state[beds_key] = min(max(st.session_state[beds_key], 1), mb)
+    st.session_state[baths_key] = min(max(st.session_state[baths_key], 1), mt)
 
 
 _d = suggest_rooms(1200)
-for k, v in {"in_area": 1200, "in_beds": _d["bedrooms"], "in_baths": _d["bathrooms"],
+for k, v in {"in_area": 1200, "in_beds": _d["bedrooms"], "in_baths": _d["bathrooms"], "in_manual": False,
              "in_age": 8, "in_garage": True, "in_garden": False, "in_lift": False,
              "in_school": True, "in_budget": 7500000, "in_loc": "Civil Lines"}.items():
     st.session_state.setdefault(k, v)
@@ -306,21 +389,26 @@ left, right = st.columns([1, 3], gap="large")
 with left:
     with st.container(key="filters_panel"):
         st.markdown('<div class="panel-title">Your property</div>', unsafe_allow_html=True)
-        area = st.number_input("Area (sq ft)", min_value=1, max_value=50000,
-                               step=50, key="in_area", on_change=_sync_rooms)
+        area = st.number_input("Area (sq ft)", min_value=1, max_value=50000, step=50, key="in_area",
+                               on_change=_on_area_change, args=("in_area", "in_beds", "in_baths", "in_manual"))
         valid_main = area >= MIN_HOME_SQFT
         if not valid_main:
             st.error(f"A home can't be built in {area} sq ft. Minimum is {MIN_HOME_SQFT} sq ft "
                      f"(a small studio / 1 RK).")
         sug = suggest_rooms(area)
         max_b, max_t = max_rooms(area)
-        st.session_state["in_beds"] = min(max(st.session_state["in_beds"], 1), max_b)
-        st.session_state["in_baths"] = min(max(st.session_state["in_baths"], 1), max_t)
+        _clamp_rooms(area, "in_beds", "in_baths")
         st.caption(f"Typical for this size: {sug['label']}, {sug['bathrooms']} bath · "
-                   f"max possible: {max_b} bed / {max_t} bath")
+                   f"max possible: {max_b} bed / {max_t} bath"
+                   + (" · rooms kept as you set them" if st.session_state["in_manual"] else ""))
         c1, c2 = st.columns(2)
-        beds = c1.number_input("Bedrooms", min_value=1, max_value=max_b, key="in_beds")
-        baths = c2.number_input("Bathrooms", min_value=1, max_value=max_t, key="in_baths")
+        beds = c1.number_input("Bedrooms", min_value=1, max_value=max_b, key="in_beds",
+                               on_change=_mark_manual, args=("in_manual",))
+        baths = c2.number_input("Bathrooms", min_value=1, max_value=max_t, key="in_baths",
+                                on_change=_mark_manual, args=("in_manual",))
+        if st.session_state["in_manual"]:
+            st.button("↺ Use suggested rooms", key="btn_rooms_reset", on_click=_reset_rooms,
+                      args=("in_area", "in_beds", "in_baths", "in_manual"), width="stretch")
         age = st.slider("Age of building (years)", 0, 60, key="in_age")
         loc_sel = st.selectbox("Locality", LOC_NAMES, key="in_loc")
 
@@ -380,9 +468,12 @@ with right:
                 if _names and len(visible) < len(STATUS_META):
                     st.caption(f"{STATUS_META[_k]['label']} ({len(_names)}): " + ", ".join(_names))
 
-            price_main, row_main = predict_one(specs_main)
-            focus_loc = loc_sel if st.session_state["has_predicted"] else None
-            focus_text = short_inr(price_main) if focus_loc else None
+            snap = st.session_state["snap"]
+            if snap is not None:
+                price_snap, row_snap = predict_one(snap)
+                focus_loc, focus_text = snap[4], short_inr(price_snap)
+            else:
+                focus_loc = focus_text = None
 
             with st.container(key="map_wrap"):
                 fig = build_map(map_df, visible, show_lm, find_place,
@@ -414,6 +505,62 @@ with right:
     </div>
     """, unsafe_allow_html=True)
 
+            # ---- what can my budget buy + CSV download ----
+            csv_df = map_df[["location", "pred", "status"]].rename(columns={"location": "Locality"})
+            csv_df.insert(1, "Locality segment", csv_df["Locality"].map(loc_df.set_index("location")["tier"]))
+            csv_df.insert(2, "Base rate (INR per sq ft)", csv_df["Locality"].map(loc_df.set_index("location")["rate_per_sqft"]))
+            csv_df.insert(3, "Distance from Civil Lines (km)", csv_df["Locality"].map(_DIST))
+            csv_df["Estimated price (INR)"] = csv_df.pop("pred").round(0).astype(int)
+            csv_df["Budget status"] = csv_df.pop("status").map(lambda s: STATUS_META[s]["label"])
+            for col, val in (("Budget (INR)", int(budget)), ("Area (sq ft)", int(area)), ("Bedrooms", int(beds)),
+                             ("Bathrooms", int(baths)), ("Age (years)", int(age)), ("Garage", int(garage)),
+                             ("Garden", int(garden)), ("Lift", int(lift)), ("Near school", int(school))):
+                csv_df[col] = val
+            csv_df = csv_df.sort_values("Estimated price (INR)").reset_index(drop=True)
+
+            bb1, bb2 = st.columns(2)
+            bb1.button("Hide what my budget buys" if st.session_state["show_afford"] else "What can my budget buy?",
+                       key="btn_afford", on_click=_toggle_afford, width="stretch")
+            bb2.download_button("Download all-locality estimates", data=csv_df.to_csv(index=False).encode("utf-8"),
+                                file_name=f"prayagraj_estimates_{int(area)}sqft.csv", mime="text/csv",
+                                key="btn_csv", width="stretch")
+
+            if st.session_state["show_afford"]:
+                res = what_budget_buys(float(budget), int(age), bool(garage), bool(garden), bool(lift), bool(school))
+                mine = res[res["Locality"] == loc_sel].iloc[0]
+                can = res.dropna(subset=["Area"]).sort_values(["Area", "Price"], ascending=False)
+                with st.container(key="card_afford"):
+                    st.markdown(f'<div class="card-title">What {short_inr(budget)} can buy</div>', unsafe_allow_html=True)
+                    if pd.notna(mine["Area"]):
+                        plus = "+" if mine["At limit"] else ""
+                        st.markdown(
+                            f'In **{loc_sel}**, {short_inr(budget)} buys a home of up to about '
+                            f'**{int(mine["Area"]):,}{plus} sq ft** ({int(mine["Beds"])} bed · {int(mine["Baths"])} bath), '
+                            f'estimated at {short_inr(mine["Price"])}.')
+                        if mine["At limit"]:
+                            st.caption(f"{AREA_CAP:,} sq ft is the largest size the model covers.")
+                    else:
+                        st.error(f"{short_inr(budget)} is not enough for even the smallest home ({MIN_HOME_SQFT} sq ft) "
+                                 f"in {loc_sel}, which is about {short_inr(mine['Smallest home price'])} there.")
+                        if len(can):
+                            st.markdown(f"**But it can buy a home in {len(can)} other localities:**")
+                    if len(can):
+                        tbl = pd.DataFrame({
+                            "Locality": can["Locality"].values,
+                            "Segment": can["Locality"].map(loc_df.set_index("location")["tier"]).values,
+                            "Largest home": [f"{int(x):,}{'+' if lim else ''} sq ft" for x, lim in zip(can["Area"], can["At limit"])],
+                            "Rooms": [f"{int(b)} bed · {int(t)} bath" for b, t in zip(can["Beds"], can["Baths"])],
+                            "Est. price": [short_inr(x) for x in can["Price"]],
+                            "": ["◀ your locality" if n == loc_sel else "" for n in can["Locality"]],
+                        })
+                        st.dataframe(tbl, hide_index=True, width="stretch", height=min(60 + 35 * len(tbl), 420))
+                    else:
+                        st.warning(f"{short_inr(budget)} is not enough for a {MIN_HOME_SQFT} sq ft home anywhere in Prayagraj "
+                                   f"with these age and amenity settings.")
+                    n_out = len(res) - len(can)
+                    st.caption(f"Uses your building age ({age} yrs) and amenities; bedrooms and bathrooms are suggested "
+                               f"for each size. {n_out} of {len(res)} localities are out of reach. Estimates, not offers.")
+
             if find_place != OVERVIEW:
                 kind, name = find_place.split("::")
                 if kind == "loc":
@@ -428,57 +575,77 @@ with right:
                     st.markdown(f'<div class="place-info"><b>{name}</b> — {r["note"]}<br>'
                                 f'Nearest locality: {r["nearest_locality"]}</div>', unsafe_allow_html=True)
 
-            # ---- estimate result ----
-            if st.session_state["has_predicted"]:
-                loc_info = loc_row(loc_sel)
-                tier_name, tier_lvl = price_tier(price_main, stats)
-                status = budget_status(price_main, budget)
-                traits = get_quality_traits(loc_info["note"], garage, garden, lift, school,
-                                            age, float(loc_info["distance_to_city_km"]))
-                why = explain_price(row_main, stats, float(loc_info["rate_per_sqft"]))
+            # ---- estimate result (frozen when you press the button) ----
+            if snap is not None:
+                s_area, s_beds, s_baths, s_age, s_loc, s_gar, s_gdn, s_lift, s_sch = snap
+                loc_info = loc_row(s_loc)
+                tier_name, tier_lvl = price_tier(price_snap, stats)
+                status = budget_status(price_snap, budget)
+                traits = get_quality_traits(loc_info["note"], s_gar, s_gdn, s_lift, s_sch,
+                                            s_age, float(loc_info["distance_to_city_km"]))
+                why = explain_price(row_snap, stats, float(loc_info["rate_per_sqft"]))
+                if snap != specs_main:
+                    st.warning("You changed the inputs after this estimate. Press **Reveal my estimate** "
+                               "to update it.")
                 rc1, rc2 = st.columns([3, 2])
                 with rc1:
                     with st.container(key="card_result"):
                         st.markdown('<div class="card-title">Estimated price</div>', unsafe_allow_html=True)
-                        st.markdown(puzzle_reveal_html(format_inr(price_main),
-                                                       f"{tier_name} · {loc_sel} · ≈ ₹{indian_grouping(price_main / area)}/sq ft",
+                        st.markdown(puzzle_reveal_html(format_inr(price_snap),
+                                                       f"{tier_name} · {s_loc} · ≈ ₹{indian_grouping(price_snap / s_area)}/sq ft",
                                                        key=f"r{st.session_state['reveal_counter']}"),
                                     unsafe_allow_html=True)
+                        st.caption(f"For: {s_area:,.0f} sq ft · {s_beds} bed · {s_baths} bath · {s_age} yrs old")
                         st.markdown(f'<span class="win-badge" style="background:{STATUS_META[status]["color"]}">'
                                     f'{STATUS_META[status]["label"]}</span>', unsafe_allow_html=True)
-                        low, high = price_main - best_mae, price_main + best_mae
-                        st.caption(f"Typical model error ±{short_inr(best_mae)} → likely range "
+                        low, high = price_snap * (1 - best_mape), price_snap * (1 + best_mape)
+                        st.caption(f"Typical model error ±{best_mape*100:.1f}% → likely range "
                                    f"{short_inr(max(low, 0))} – {short_inr(high)}")
                         st.markdown('<div class="panel-sub">Why this estimate</div>', unsafe_allow_html=True)
                         for b in why:
                             st.markdown(f"- {b}")
                         st.markdown("".join(f'<span class="pill">{t}</span>' for t in traits),
                                     unsafe_allow_html=True)
-                        if area > AREA_CAP or beds > BED_CAP or baths > BATH_CAP:
-                            st.caption("Your size is beyond the training data, so the price is scaled up from "
-                                       "the largest homes the model has seen. Treat it as a rough guide.")
+                        if s_area > AREA_CAP:
+                            st.caption(f"{s_area:,.0f} sq ft is beyond the largest home the model has seen "
+                                       f"({AREA_CAP:,} sq ft), so the price is scaled up from that. "
+                                       f"Treat it as a rough guide.")
+                        elif s_area < AREA_FLOOR:
+                            st.caption(f"{s_area:,.0f} sq ft is smaller than the homes the model has seen "
+                                       f"(from {AREA_FLOOR} sq ft), so the price is scaled down. Rough guide only.")
                 with rc2:
                     with st.container(key="card_house"):
                         st.markdown('<div class="card-title">Your home</div>', unsafe_allow_html=True)
-                        st.markdown(render_house_svg(tier_lvl, garage, garden, lift), unsafe_allow_html=True)
+                        st.markdown(render_house_svg(tier_lvl, s_gar, s_gdn, s_lift), unsafe_allow_html=True)
             else:
                 st.info("Set your property details on the left and press **Reveal my estimate**.")
 
     # ======================= COMPARE TAB =======================
     with tab_cmp:
         def spec_block(tag, title, defaults):
+            ss = st.session_state
+            ak, bk, tk, mk = f"{tag}_area", f"{tag}_bed", f"{tag}_bath", f"{tag}_manual"
+            ss.setdefault(ak, defaults["area"])
+            ss.setdefault(mk, False)
+            if bk not in ss:
+                _apply_suggested(ak, bk, tk)
             with st.container(key=f"card_spec_{tag}"):
                 st.markdown(f'<div class="card-title">{title}</div>', unsafe_allow_html=True)
                 loc = st.selectbox("Locality", LOC_NAMES, index=LOC_NAMES.index(defaults["loc"]), key=f"{tag}_loc")
-                ar = st.number_input("Area (sq ft)", 1, 50000, defaults["area"], 50, key=f"{tag}_area")
+                ar = st.number_input("Area (sq ft)", 1, 50000, step=50, key=ak,
+                                     on_change=_on_area_change, args=(ak, bk, tk, mk))
                 if ar < MIN_HOME_SQFT:
                     st.error(f"Minimum is {MIN_HOME_SQFT} sq ft — nothing liveable fits in {ar} sq ft.")
-                s = suggest_rooms(ar)
                 mb, mt = max_rooms(ar)
-                st.caption(f"Max possible for this size: {mb} bed / {mt} bath")
+                _clamp_rooms(ar, bk, tk)
+                st.caption(f"Max possible for this size: {mb} bed / {mt} bath"
+                           + (" · rooms kept as you set them" if ss[mk] else ""))
                 x1, x2 = st.columns(2)
-                bd = x1.number_input("Bedrooms", 1, mb, min(s["bedrooms"], mb), key=f"{tag}_bed_{ar}")
-                bt = x2.number_input("Bathrooms", 1, mt, min(s["bathrooms"], mt), key=f"{tag}_bath_{ar}")
+                bd = x1.number_input("Bedrooms", 1, mb, key=bk, on_change=_mark_manual, args=(mk,))
+                bt = x2.number_input("Bathrooms", 1, mt, key=tk, on_change=_mark_manual, args=(mk,))
+                if ss[mk]:
+                    st.button("↺ Use suggested rooms", key=f"{tag}_rooms_reset", on_click=_reset_rooms,
+                              args=(ak, bk, tk, mk), width="stretch")
                 ag = st.slider("Age (years)", 0, 60, defaults["age"], key=f"{tag}_age")
                 y1, y2 = st.columns(2)
                 g1 = y1.checkbox("Garage", defaults["garage"], key=f"{tag}_garage")
@@ -575,17 +742,13 @@ with right:
 
     # ======================= EMI TAB =======================
     with tab_emi:
-        # Price follows the latest estimate; down payment follows the budget.
-        # Both stay editable by hand until the estimate / budget changes again.
-        est_price = int(round(price_main, -3)) if (st.session_state["has_predicted"] and valid_main) else None
+        # Price follows the estimate you revealed; down payment is a % of that price (default 20%).
+        est_price = int(round(price_snap, -3)) if snap is not None else None
         if st.session_state.get("_emi_est") != est_price:
             st.session_state["_emi_est"] = est_price
             st.session_state["emi_price"] = est_price
-        if st.session_state.get("_emi_budget") != budget:
-            st.session_state["_emi_budget"] = budget
-            st.session_state["emi_down"] = int(budget)
         st.session_state.setdefault("emi_price", est_price)
-        st.session_state.setdefault("emi_down", int(budget))
+        st.session_state.setdefault("emi_down_pct", 20)
 
         e1, e2 = st.columns([1, 2], gap="large")
         with e1:
@@ -595,9 +758,11 @@ with right:
                                            step=100000, key="emi_price",
                                            placeholder="Reveal an estimate or type a price")
                 if est_price is not None and price_in == est_price:
-                    st.caption(f"Taken from your estimate for {loc_sel}")
-                down_in = st.number_input("Down payment (₹) — from your budget", min_value=0,
-                                          max_value=1000000000, step=100000, key="emi_down")
+                    st.caption(f"Taken from your estimate for {snap[4]}")
+                down_pct = st.slider("Down payment (% of price)", 0, 100, key="emi_down_pct")
+                if price_in is not None:
+                    st.caption(f"= {short_inr(price_in * down_pct / 100)} down, "
+                               f"{short_inr(price_in * (100 - down_pct) / 100)} loan")
                 rate = st.slider("Interest rate (% per year)", 5.0, 15.0, 8.5, 0.05, key="emi_rate")
                 years = st.slider("Tenure (years)", 1, 30, 20, key="emi_years")
                 income = st.number_input("Monthly income (₹, optional)", min_value=0, value=0,
@@ -608,7 +773,7 @@ with right:
                 st.info("Go to the **Map** tab, enter your property details and press **Reveal my estimate** — "
                         "the price will appear here automatically. You can also type a price yourself.")
             else:
-                down = min(float(down_in), float(price_in))
+                down = float(price_in) * down_pct / 100
                 loan = float(price_in) - down
                 n = years * 12
                 r = rate / 12 / 100
@@ -630,9 +795,8 @@ with right:
                                  unsafe_allow_html=True)
 
                 if loan <= 0:
-                    st.markdown(f'<div class="callout">Your down payment of {short_inr(down_in)} covers the '
-                                f'full price of {short_inr(price_in)} — no loan needed.</div>',
-                                unsafe_allow_html=True)
+                    st.markdown(f'<div class="callout">A 100% down payment covers the full price of '
+                                f'{short_inr(price_in)} — no loan needed.</div>', unsafe_allow_html=True)
                 else:
                     st.caption(f"Price {short_inr(price_in)} − down payment {short_inr(down)} "
                                f"({down / price_in * 100:.0f}%) = loan {short_inr(loan)}")

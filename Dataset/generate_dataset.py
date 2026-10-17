@@ -100,14 +100,21 @@ lm_df.to_csv(os.path.join(SCRIPT_DIR, "landmarks.csv"), index=False)
 # ---------------------------------------------------------------------------
 # HOUSES
 # ---------------------------------------------------------------------------
-N = 3000
+N = 3500
 w = loc_df.weight / loc_df.weight.sum()
 idx = np.random.choice(len(loc_df), N, p=w)
 loc = loc_df.iloc[idx].reset_index(drop=True)
 
-area = np.clip(np.random.lognormal(np.log(1250), 0.42, N), 350, 5000).round(0)
-bedrooms = np.clip(np.round(area / 480 + np.random.normal(0, 0.6, N)), 1, 6).astype(int)
-bathrooms = np.clip(np.round(bedrooms * 0.75 + np.random.normal(0, 0.6, N)), 1, 4).astype(int)
+area = np.clip(np.random.lognormal(np.log(1250), 0.42, N), 350, 5000)
+# ~8% large homes / bungalows so the model has really seen big plots and many
+# rooms (earlier versions stopped at 5,000 sq ft, 6 bedrooms, 4 bathrooms).
+big = np.random.rand(N) < 0.08
+area[big] = np.clip(np.random.lognormal(np.log(6000), 0.35, big.sum()), 3000, 12000)
+area = area.round(0)
+# about 1 bedroom per 480 sq ft up to ~2,900 sq ft, then 1 more per 1,500 sq ft
+bed_mean = np.where(area <= 2900, area / 480, 6 + (area - 2900) / 1500)
+bedrooms = np.clip(np.round(bed_mean + np.random.normal(0, 0.6, N)), 1, 14).astype(int)
+bathrooms = np.clip(np.round(bedrooms * 0.75 + np.random.normal(0, 0.6, N)), 1, 11).astype(int)
 age = np.clip(np.random.gamma(2.0, 7.0, N), 0, 60).round().astype(int)
 
 rate = loc.rate_per_sqft.values
