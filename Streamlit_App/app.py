@@ -195,7 +195,9 @@ def predict_one(specs):
 # ---------------------------------------------------------------------------
 # WHAT CAN MY BUDGET BUY?  (largest home each locality offers for a budget)
 # ---------------------------------------------------------------------------
-AFFORD_AREAS = np.arange(MIN_HOME_SQFT, AREA_CAP + 1, 50)
+AFFORD_MAX = 50000        # same limit as the area box
+AFFORD_AREAS = np.concatenate([np.arange(MIN_HOME_SQFT, AREA_CAP + 1, 50),
+                               np.arange(AREA_CAP + 250, AFFORD_MAX + 1, 250)])
 _aff_rooms = [(min(suggest_rooms(x)["bedrooms"], max_rooms(x)[0]),
                min(suggest_rooms(x)["bathrooms"], max_rooms(x)[1])) for x in AFFORD_AREAS]
 AFFORD_BEDS = np.array([r[0] for r in _aff_rooms])
@@ -395,10 +397,16 @@ with left:
         if not valid_main:
             st.error(f"A home can't be built in {area} sq ft. Minimum is {MIN_HOME_SQFT} sq ft "
                      f"(a small studio / 1 RK).")
+        elif area > AREA_CAP:
+            st.info(f"{area:,} sq ft is bigger than any home the model was trained on ({AREA_CAP:,} sq ft). "
+                    f"The price is scaled up with area and rooms stop at {BED_CAP} bed / {BATH_CAP} bath, "
+                    f"so treat it as a rough guide.")
         sug = suggest_rooms(area)
         max_b, max_t = max_rooms(area)
         _clamp_rooms(area, "in_beds", "in_baths")
-        st.caption(f"Typical for this size: {sug['label']}, {sug['bathrooms']} bath · "
+        sug_b, sug_t = min(sug["bedrooms"], max_b), min(sug["bathrooms"], max_t)
+        st.caption(f"Typical for this size: {sug_b} BHK, {sug_t} bath"
+                   + (" (model limit)" if (sug_b, sug_t) != (sug["bedrooms"], sug["bathrooms"]) else "") + " · "
                    f"max possible: {max_b} bed / {max_t} bath"
                    + (" · rooms kept as you set them" if st.session_state["in_manual"] else ""))
         c1, c2 = st.columns(2)
@@ -533,12 +541,16 @@ with right:
                     st.markdown(f'<div class="card-title">What {short_inr(budget)} can buy</div>', unsafe_allow_html=True)
                     if pd.notna(mine["Area"]):
                         plus = "+" if mine["At limit"] else ""
+                        rough = "~" if mine["Area"] > AREA_CAP else ""
                         st.markdown(
                             f'In **{loc_sel}**, {short_inr(budget)} buys a home of up to about '
-                            f'**{int(mine["Area"]):,}{plus} sq ft** ({int(mine["Beds"])} bed · {int(mine["Baths"])} bath), '
+                            f'**{rough}{int(mine["Area"]):,}{plus} sq ft** ({int(mine["Beds"])} bed · {int(mine["Baths"])} bath), '
                             f'estimated at {short_inr(mine["Price"])}.')
+                        if mine["Area"] > AREA_CAP:
+                            st.caption(f"Above {AREA_CAP:,} sq ft the model has no data: the price is scaled with "
+                                       f"area and rooms are capped at {BED_CAP} bed / {BATH_CAP} bath. Rough guide.")
                         if mine["At limit"]:
-                            st.caption(f"{AREA_CAP:,} sq ft is the largest size the model covers.")
+                            st.caption(f"{AFFORD_MAX:,} sq ft is the largest size this app accepts.")
                     else:
                         st.error(f"{short_inr(budget)} is not enough for even the smallest home ({MIN_HOME_SQFT} sq ft) "
                                  f"in {loc_sel}, which is about {short_inr(mine['Smallest home price'])} there.")
@@ -548,7 +560,7 @@ with right:
                         tbl = pd.DataFrame({
                             "Locality": can["Locality"].values,
                             "Segment": can["Locality"].map(loc_df.set_index("location")["tier"]).values,
-                            "Largest home": [f"{int(x):,}{'+' if lim else ''} sq ft" for x, lim in zip(can["Area"], can["At limit"])],
+                            "Largest home": [f"{'~' if x > AREA_CAP else ''}{int(x):,}{'+' if lim else ''} sq ft" for x, lim in zip(can["Area"], can["At limit"])],
                             "Rooms": [f"{int(b)} bed · {int(t)} bath" for b, t in zip(can["Beds"], can["Baths"])],
                             "Est. price": [short_inr(x) for x in can["Price"]],
                             "": ["◀ your locality" if n == loc_sel else "" for n in can["Locality"]],
