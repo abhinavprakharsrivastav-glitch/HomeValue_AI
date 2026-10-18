@@ -446,6 +446,12 @@ map_df["pred"] = preds
 map_df["status"] = [budget_status(p, budget) for p in preds]
 map_df["tier"] = [price_tier(p, stats)[0] for p in preds]
 
+# The revealed estimate, computed once up here so every tab can use it even when the
+# area box currently holds an invalid value (e.g. typed 12 after revealing).
+snap = st.session_state["snap"]
+if snap is not None:
+    price_snap, row_snap = predict_one(snap)
+
 # ---------------------------------------------------------------------------
 # RIGHT: TABS
 # ---------------------------------------------------------------------------
@@ -476,12 +482,7 @@ with right:
                 if _names and len(visible) < len(STATUS_META):
                     st.caption(f"{STATUS_META[_k]['label']} ({len(_names)}): " + ", ".join(_names))
 
-            snap = st.session_state["snap"]
-            if snap is not None:
-                price_snap, row_snap = predict_one(snap)
-                focus_loc, focus_text = snap[4], short_inr(price_snap)
-            else:
-                focus_loc = focus_text = None
+            focus_loc, focus_text = (snap[4], short_inr(price_snap)) if snap is not None else (None, None)
 
             with st.container(key="map_wrap"):
                 fig = build_map(map_df, visible, show_lm, find_place,
